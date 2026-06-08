@@ -1,3 +1,9 @@
 bin/
 obj/
 *.user
+
+# Visual Studio local state
+.vs/
+
+# Auto-generated IDE launch profiles
+**/Properties/launchSettings.json
