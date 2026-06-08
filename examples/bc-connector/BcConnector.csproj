@@ -5,12 +5,12 @@
     <LangVersion>12</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>CrmConnector</AssemblyName>
-    <RootNamespace>CrmConnector</RootNamespace>
-    <Description>Generic CRM connector example for VestedAI.ConnectorSdk.</Description>
+    <AssemblyName>BcConnector</AssemblyName>
+    <RootNamespace>BcConnector</RootNamespace>
+    <Description>On-prem Dynamics 365 Business Central connector example for VestedAI.ConnectorSdk.</Description>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../src/VestedAI.ConnectorSdk/VestedAI.ConnectorSdk.csproj" />
+    <PackageReference Include="VestedAI.ConnectorSdk" Version="0.2.0" />
   </ItemGroup>
 </Project>
