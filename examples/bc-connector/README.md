@@ -25,7 +25,7 @@ and enforces business rules in AL. See the `ASG AI Gateway` AL extension's
 | One tool → one named operation dispatched to a single endpoint | `Tools.cs` |
 | List results (search) returned as a typed `Result` from the gateway | `Tools.cs` |
 | Calling a single custom API endpoint (bound action, basic auth) | `BcClient.cs` |
-| Resolving the company id + gateway record id once and caching them | `BcClient.cs` |
+| Resolving the gateway record id per company and caching it | `BcClient.cs` |
 | Process-wide HTTP client built from env at startup | `BcClient.cs`, `Program.cs` |
 | `ConnectorHost.RunFromEnvironmentAsync` entrypoint | `Program.cs` |
 | Multi-stage Docker build (SDK → runtime base) | `Dockerfile` |
@@ -99,8 +99,8 @@ Copy `.env.example` to `.env` and fill in the values:
 | `VESTED_CONNECTOR_TOKEN` | yes | Connector JWT from the Vested AI platform |
 | `VESTED_CONNECTOR_HUB` | yes | Hub gRPC endpoint, `host:port` |
 | `LOG_LEVEL` | no | `Trace`…`Error` (default `Information`) |
-| `BC_BASE_URL` | yes | Gateway API base URL: `http(s)://<host>:<port>/<serverinstance>/api/asg/ai/v1.0` |
-| `BC_COMPANY` | yes | Company name exactly as in BC (used to resolve the company id) |
+| `BC_BASE_URL` | yes | BC ODataV4 base URL: `http(s)://<host>:<port>/<serverinstance>/ODataV4` (only OData Services need to be enabled, not API Services) |
+| `BC_COMPANY` | yes | **Default** company name exactly as in BC (e.g. `ASG`). Used when a tool call omits `company`. |
 | `BC_USERNAME` | yes | BC user name |
 | `BC_PASSWORD` | yes | The user's **Web Service Access Key** (recommended) or password |
 | `BC_TIMEOUT_SECONDS` | no | Per-request HTTP timeout in seconds (default `30`) |
@@ -109,19 +109,39 @@ Copy `.env.example` to `.env` and fill in the values:
 at startup and throws with a clear message if any are missing — the process exits
 before connecting to the hub.
 
+### Companies (multi-company)
+
+The connector serves multiple Business Central companies, one per country. Every
+tool accepts an optional **`company`** argument (the exact BC company name); when
+omitted, the default from `BC_COMPANY` (normally `ASG`) is used. The agents map a
+country mentioned by the user to the matching company:
+
+| `company` value | Country |
+|---|---|
+| `ASG` | Saudi Arabia (السعودية) — **default** |
+| `ASG - KWT` | Kuwait (الكويت) |
+| `ASG - OM` | Oman (عُمان) |
+| `ASG - QAR` | Qatar (قطر) |
+| `ASG - UAE` | UAE (الإمارات) |
+
+`company` is a routing field: `BcClient` strips it from the args, uses it to select
+the company in the URL, and never forwards it in the operation payload. The gateway
+record id is resolved and cached **per company**. Each company must have the ASG
+Customization app installed (its install/upgrade codeunit seeds the gateway record).
+
 ### How requests are formed
 
-On the first call, `BcClient` resolves two ids and caches them for the process:
+For each call, `BcClient` resolves the gateway record id for the target company
+(cached per company for the process):
 
 ```
-GET {BC_BASE_URL}/companies?$filter=name eq '{BC_COMPANY}'&$top=1   → company id
-GET {BC_BASE_URL}/companies({companyId})/aiGateways?$top=1          → gateway record id
+GET {BC_BASE_URL}/Company('{company}')/aiGateway?$top=1   → gateway record id
 ```
 
 Every tool then `POST`s its operation to the gateway's bound action:
 
 ```
-POST {BC_BASE_URL}/companies({companyId})/aiGateways({gatewayId})/Microsoft.NAV.executeOperation
+POST {BC_BASE_URL}/Company('{company}')/aiGateway({gatewayId})/NAV.executeOperation
 Content-Type: application/json
 
 { "operation": "GetCustomer", "payload": "{\"customerNo\":\"C00010\"}" }
@@ -147,8 +167,8 @@ bc-connector/
 ├── BcConnector.csproj    # Exe project; references the SDK via ProjectReference
 ├── Program.cs            # BcClient.Configure() → ConnectorHost → RunFromEnvironmentAsync
 ├── Agents.cs             # [Agent] + [Instruction] declarations (4 agents)
-├── Tools.cs              # Thirteen [Tool] ToolHandler<,> implementations (each dispatches one operation)
-├── BcClient.cs           # Shared ASG AI Gateway client (basic auth; ExecuteAsync + id resolution)
+├── Tools.cs              # Eighteen [Tool] ToolHandler<,> implementations (each dispatches one operation)
+├── BcClient.cs           # Shared ASG AI Gateway client over ODataV4 (basic auth; per-company gateway-id resolution)
 ├── .env.example          # Environment variable template
 ├── Dockerfile            # Multi-stage build (dotnet/sdk:8.0 → dotnet/runtime:8.0)
 └── README.md             # This file
@@ -436,8 +456,8 @@ Run the image (pass every required variable):
 docker run --rm \
   -e VESTED_CONNECTOR_TOKEN=<your-token> \
   -e VESTED_CONNECTOR_HUB=hub.example.com:4443 \
-  -e BC_BASE_URL=http://bc-host:7048/BC/api/asg/ai/v1.0 \
-  -e BC_COMPANY='CRONUS International Ltd.' \
+  -e BC_BASE_URL=https://bc-host:8048/BC/ODataV4 \
+  -e BC_COMPANY=ASG \
   -e BC_USERNAME=<bc-user> \
   -e BC_PASSWORD=<web-service-access-key> \
   bc-connector:local
@@ -458,10 +478,9 @@ docker run --rm \
    automatically. Keep the camelCase JSON keys in sync on both sides.
 2. **Add agents:** declare another `[Agent]`; remember tool keys must start with
    `<agentKey>.`.
-3. **Switch to OAuth (e.g. BC cloud):** the gateway is a standard API page, so the
-   same endpoint works with an OAuth bearer token — replace the `Basic` header in
+3. **Switch to OAuth (e.g. BC cloud):** replace the `Basic` header in
    `BcClient.Configure()` with a bearer token and point `BC_BASE_URL` at the cloud
-   `…/api/asg/ai/v1.0` base. The id-resolution and `ExecuteAsync` logic is unchanged.
+   `…/ODataV4` base. The company routing and `ExecuteAsync` logic is unchanged.
 4. **Update `.env.example`** with any new variables.
 
 ---

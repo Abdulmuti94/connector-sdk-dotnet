@@ -1,7 +1,9 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using VestedAI.ConnectorSdk.Errors;
 
@@ -28,8 +30,10 @@ namespace BcConnector;
 
 /// <summary>
 /// Thin client for the ASG AI Gateway over ODataV4, authenticated with
-/// NavUserPassword basic auth. Resolves the singleton gateway-record id once,
-/// then invokes the bound action for each operation.
+/// NavUserPassword basic auth. Each call may target a specific BC company
+/// (tools expose an optional <c>company</c> arg); when none is given the
+/// default company from BC_COMPANY is used. The singleton gateway-record id is
+/// resolved and cached per company.
 /// </summary>
 internal static class BcClient
 {
@@ -37,11 +41,11 @@ internal static class BcClient
     private const string GatewayEntity = "aiGateway";
 
     private static HttpClient? _http;
-    private static string _apiBase = "";   // e.g. https://bc-host:8048/BC/ODataV4
-    private static string _company = "";
+    private static string _apiBase = "";          // e.g. https://bc-host:8048/BC/ODataV4
+    private static string _defaultCompany = "";   // from BC_COMPANY, used when a call omits 'company'
 
-    // Resolved lazily on first use and cached for the process lifetime.
-    private static Guid _gatewayId = Guid.Empty;
+    // Gateway record id per company, resolved lazily and cached for the process lifetime.
+    private static readonly ConcurrentDictionary<string, Guid> _gatewayIds = new();
     private static readonly SemaphoreSlim _initLock = new(1, 1);
 
     // camelCase on the wire: matches the JSON keys the AL gateway reads/writes.
@@ -60,12 +64,12 @@ internal static class BcClient
     public static void Configure()
     {
         var baseUrl  = Require("BC_BASE_URL");   // e.g. https://bc-host:8048/BC/ODataV4
-        var company  = Require("BC_COMPANY");    // e.g. CRONUS International Ltd.
+        var company  = Require("BC_COMPANY");    // default company, e.g. ASG
         var username = Require("BC_USERNAME");
         var password = Require("BC_PASSWORD");
 
         _apiBase = baseUrl.TrimEnd('/');
-        _company = company;
+        _defaultCompany = company;
 
         var timeoutSeconds = int.TryParse(
             Environment.GetEnvironmentVariable("BC_TIMEOUT_SECONDS"), out var t) ? t : 30;
@@ -115,13 +119,16 @@ internal static class BcClient
         string toolKey)
     {
         var http = Ready(toolKey);
-        await EnsureIdsAsync(toolKey);
+
+        // 'company' is a routing field (selects the BC company in the URL), not part
+        // of the operation payload — split it out before building the body.
+        var (company, payloadJson) = SplitCompany(args);
+        var gatewayId = await ResolveGatewayIdAsync(company, toolKey);
 
         // payload is a JSON string parameter on the AL bound action, so the args
         // object is serialized to a string and nested inside the action body.
-        var payloadJson = JsonSerializer.Serialize(args ?? new { }, JsonOpts);
         var body = JsonSerializer.Serialize(new { operation, payload = payloadJson });
-        var url = $"{_apiBase}/{CompanySegment()}/{GatewayEntity}({_gatewayId:D})/{GatewayAction}";
+        var url = $"{_apiBase}/{CompanySegment(company)}/{GatewayEntity}({gatewayId:D})/{GatewayAction}";
 
         using var response = await SendAsync(http, HttpMethod.Post, url, body, toolKey);
         var outer = await ReadJsonAsync(response, toolKey);
@@ -151,20 +158,60 @@ internal static class BcClient
     }
 
     // ---------------------------------------------------------------------------
-    // Id resolution (singleton gateway record), cached for the process. The company
-    // is addressed by name in the URL, so only the gateway record id is resolved.
+    // Company routing + id resolution. The company is addressed by name in the URL;
+    // the singleton gateway-record id is resolved once per company and cached.
     // ---------------------------------------------------------------------------
 
-    private static async Task EnsureIdsAsync(string toolKey)
+    // Extract the optional 'company' field from the args and return it alongside the
+    // remaining payload JSON (with 'company' removed). Falls back to the default
+    // company from BC_COMPANY when the field is absent or blank.
+    private static (string company, string payloadJson) SplitCompany(object args)
     {
-        if (_gatewayId != Guid.Empty)
-            return;
+        var node = JsonSerializer.SerializeToNode(args ?? new { }, JsonOpts)?.AsObject()
+                   ?? new JsonObject();
+
+        var company = _defaultCompany;
+        var key = node.FirstOrDefault(
+            p => string.Equals(p.Key, "company", StringComparison.OrdinalIgnoreCase)).Key;
+        if (key is not null)
+        {
+            var value = node[key]?.GetValue<string>();
+            if (!string.IsNullOrWhiteSpace(value))
+                company = value.Trim();
+            node.Remove(key);
+        }
+
+        return (company, node.ToJsonString(JsonOpts));
+    }
+
+    private static async Task<Guid> ResolveGatewayIdAsync(string company, string toolKey)
+    {
+        if (_gatewayIds.TryGetValue(company, out var cached))
+            return cached;
 
         await _initLock.WaitAsync();
         try
         {
-            if (_gatewayId == Guid.Empty)
-                _gatewayId = await ResolveGatewayIdAsync(toolKey);
+            if (_gatewayIds.TryGetValue(company, out cached))
+                return cached;
+
+            var http = Ready(toolKey);
+            var url = $"{_apiBase}/{CompanySegment(company)}/{GatewayEntity}?$top=1";
+
+            using var response = await SendAsync(http, HttpMethod.Get, url, body: null, toolKey);
+            var json = await ReadJsonAsync(response, toolKey);
+
+            if (TryFirstId(json, out var id))
+            {
+                _gatewayIds[company] = id;
+                return id;
+            }
+
+            throw new ToolValidationException(
+                toolKey,
+                $"The ASG AI Gateway record was not found in company '{company}'. Ensure the " +
+                "ASG Customization app is installed there (its install/upgrade codeunit seeds " +
+                "the record), and that the company name is exposed over ODataV4.");
         }
         finally
         {
@@ -172,28 +219,10 @@ internal static class BcClient
         }
     }
 
-    private static async Task<Guid> ResolveGatewayIdAsync(string toolKey)
-    {
-        var http = Ready(toolKey);
-        var url = $"{_apiBase}/{CompanySegment()}/{GatewayEntity}?$top=1";
-
-        using var response = await SendAsync(http, HttpMethod.Get, url, body: null, toolKey);
-        var json = await ReadJsonAsync(response, toolKey);
-
-        if (TryFirstId(json, out var id))
-            return id;
-
-        throw new ToolValidationException(
-            toolKey,
-            "The ASG AI Gateway record was not found in Business Central. Ensure the ASG " +
-            "Customization app is installed (its install/upgrade codeunit seeds the record), " +
-            $"and that BC_COMPANY ('{_company}') names a company exposed over ODataV4.");
-    }
-
     // OData company key segment, addressing the company by name: Company('ASG').
     // The name is percent-encoded; an embedded apostrophe is OData-escaped ('').
-    private static string CompanySegment() =>
-        $"Company('{Uri.EscapeDataString(_company.Replace("'", "''"))}')";
+    private static string CompanySegment(string company) =>
+        $"Company('{Uri.EscapeDataString(company.Replace("'", "''"))}')";
 
     // Read value[0].id from an OData collection response as a Guid.
     private static bool TryFirstId(JsonElement json, out Guid id)

@@ -31,6 +31,17 @@ namespace BcConnector;
         the match before acting. Before creating a sales order, confirm the customer exists and
         is not blocked. A new order has no lines until you add them with add_sales_order_line.
         Report monetary values in the company's local currency (LCY).
+
+        Company selection — this connector serves one Business Central company per country.
+        Every tool accepts an optional `company` argument (the exact BC company name):
+          • ASG = Saudi Arabia (السعودية) — the default
+          • ASG - KWT = Kuwait (الكويت)
+          • ASG - OM = Oman (عُمان)
+          • ASG - QAR = Qatar (قطر)
+          • ASG - UAE = United Arab Emirates (الإمارات)
+        When the user names a country, pass the matching company (e.g. Qatar → company "ASG - QAR").
+        When no company or country is mentioned, omit `company`; the default ASG (Saudi Arabia) is used.
+
         Never invent customer, item, or order data — rely on the tools for all Business Central facts.
         """)]
 public class SalesOpsAgent { }
@@ -60,6 +71,17 @@ public class SalesOpsAgent { }
         When the user describes a product rather than giving a number, use find_items first and
         confirm the match before reporting details. When an item is out of stock (Inventory of 0
         or less), say so explicitly.
+
+        Company selection — this connector serves one Business Central company per country.
+        Every tool accepts an optional `company` argument (the exact BC company name):
+          • ASG = Saudi Arabia (السعودية) — the default
+          • ASG - KWT = Kuwait (الكويت)
+          • ASG - OM = Oman (عُمان)
+          • ASG - QAR = Qatar (قطر)
+          • ASG - UAE = United Arab Emirates (الإمارات)
+        When the user names a country, pass the matching company (e.g. Qatar → company "ASG - QAR").
+        When no company or country is mentioned, omit `company`; the default ASG (Saudi Arabia) is used.
+
         Never invent item data — rely on the tools for all Business Central facts.
         """)]
 public class InventoryAgent { }
@@ -91,6 +113,17 @@ public class InventoryAgent { }
         the tool marks it overdue — do not infer it yourself. When asked only about overdue items,
         set overdueOnly so the customer is not shown entries that are merely open.
         Report monetary values in the company's local currency (LCY).
+
+        Company selection — this connector serves one Business Central company per country.
+        Every tool accepts an optional `company` argument (the exact BC company name):
+          • ASG = Saudi Arabia (السعودية) — the default
+          • ASG - KWT = Kuwait (الكويت)
+          • ASG - OM = Oman (عُمان)
+          • ASG - QAR = Qatar (قطر)
+          • ASG - UAE = United Arab Emirates (الإمارات)
+        When the user names a country, pass the matching company (e.g. Qatar → company "ASG - QAR").
+        When no company or country is mentioned, omit `company`; the default ASG (Saudi Arabia) is used.
+
         Never invent ledger, invoice, or balance data — rely on the tool for all Business Central facts.
         """)]
 public class FinanceAgent { }
@@ -125,6 +158,17 @@ public class FinanceAgent { }
         is not blocked. A new order has no lines until you add them with add_purchase_order_line.
         Purchase lines carry a direct unit cost (what you pay the vendor), not a sales price.
         Report monetary values in the company's local currency (LCY).
+
+        Company selection — this connector serves one Business Central company per country.
+        Every tool accepts an optional `company` argument (the exact BC company name):
+          • ASG = Saudi Arabia (السعودية) — the default
+          • ASG - KWT = Kuwait (الكويت)
+          • ASG - OM = Oman (عُمان)
+          • ASG - QAR = Qatar (قطر)
+          • ASG - UAE = United Arab Emirates (الإمارات)
+        When the user names a country, pass the matching company (e.g. Qatar → company "ASG - QAR").
+        When no company or country is mentioned, omit `company`; the default ASG (Saudi Arabia) is used.
+
         Never invent vendor, item, or order data — rely on the tools for all Business Central facts.
         """)]
 public class PurchasingAgent { }

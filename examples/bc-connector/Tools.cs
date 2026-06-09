@@ -29,6 +29,9 @@ public class GetCustomer : ToolHandler<GetCustomer.Args, GetCustomer.Result>
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Business Central customer number, e.g. C00010 or 10000.")]
         public string CustomerNo { get; set; } = "";
     }
@@ -84,6 +87,9 @@ public class GetItem : ToolHandler<GetItem.Args, GetItem.Result>
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Business Central item number, e.g. 1000 or ITEM-001.")]
         public string ItemNo { get; set; } = "";
     }
@@ -132,6 +138,9 @@ public class CreateSalesOrder : ToolHandler<CreateSalesOrder.Args, CreateSalesOr
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Customer number (No.) the order is sold to, e.g. C00010.")]
         public string CustomerNo { get; set; } = "";
 
@@ -178,6 +187,9 @@ public class FindCustomers : ToolHandler<FindCustomers.Args, FindCustomers.Resul
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Optional. Text to search for within the customer name (case-insensitive substring). Leave empty to list customers without filtering.")]
         public string NameContains { get; set; } = "";
 
@@ -235,6 +247,9 @@ public class GetSalesOrder : ToolHandler<GetSalesOrder.Args, GetSalesOrder.Resul
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Sales order number (No.), e.g. S-ORD-101001.")]
         public string OrderNo { get; set; } = "";
     }
@@ -293,6 +308,9 @@ public class AddSalesOrderLine : ToolHandler<AddSalesOrderLine.Args, AddSalesOrd
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Sales order number (No.) to add the line to, e.g. S-ORD-101001.")]
         public string OrderNo { get; set; } = "";
 
@@ -363,6 +381,9 @@ public class FindItems : ToolHandler<FindItems.Args, FindItems.Result>
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Optional. Text to search for within the item description (case-insensitive substring). Leave empty to list items without filtering.")]
         public string DescriptionContains { get; set; } = "";
 
@@ -418,6 +439,9 @@ public class ListOpenCustomerEntries
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Customer number (No.) whose open ledger entries to list, e.g. C00010.")]
         public string CustomerNo { get; set; } = "";
 
@@ -491,6 +515,9 @@ public class FindVendors : ToolHandler<FindVendors.Args, FindVendors.Result>
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Optional. Text to search for within the vendor name (case-insensitive substring). Leave empty to list vendors without filtering.")]
         public string NameContains { get; set; } = "";
 
@@ -548,6 +575,9 @@ public class GetVendor : ToolHandler<GetVendor.Args, GetVendor.Result>
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Business Central vendor number, e.g. V00010 or 10000.")]
         public string VendorNo { get; set; } = "";
     }
@@ -600,6 +630,9 @@ public class CreatePurchaseOrder : ToolHandler<CreatePurchaseOrder.Args, CreateP
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Vendor number (No.) the order is bought from, e.g. V00010.")]
         public string VendorNo { get; set; } = "";
 
@@ -647,6 +680,9 @@ public class AddPurchaseOrderLine : ToolHandler<AddPurchaseOrderLine.Args, AddPu
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Purchase order number (No.) to add the line to, e.g. P-ORD-101001.")]
         public string OrderNo { get; set; } = "";
 
@@ -717,6 +753,9 @@ public class GetPurchaseOrder : ToolHandler<GetPurchaseOrder.Args, GetPurchaseOr
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Purchase order number (No.), e.g. P-ORD-101001.")]
         public string OrderNo { get; set; } = "";
     }
@@ -782,6 +821,9 @@ public class CreateTransferOrder : ToolHandler<CreateTransferOrder.Args, CreateT
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Source location code stock is transferred from (e.g. MAIN, BLUE).")]
         public string TransferFromCode { get; set; } = "";
 
@@ -872,6 +914,9 @@ public class AddTransferOrderLine : ToolHandler<AddTransferOrderLine.Args, AddTr
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Transfer order number (No.) to add the line to.")]
         public string TransferOrderNo { get; set; } = "";
 
@@ -950,6 +995,9 @@ public class GetTransferOrder : ToolHandler<GetTransferOrder.Args, GetTransferOr
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Transfer order number (No.), e.g. 1001.")]
         public string TransferOrderNo { get; set; } = "";
     }
@@ -1058,6 +1106,9 @@ public class FindTransferOrders : ToolHandler<FindTransferOrders.Args, FindTrans
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Optional source location code to filter by. Leave empty to include all.")]
         public string TransferFromCode { get; set; } = "";
 
@@ -1130,6 +1181,9 @@ public class PostTransferOrder : ToolHandler<PostTransferOrder.Args, PostTransfe
 {
     public class Args
     {
+        [Description("Optional Business Central company to run against, by name: 'ASG' (Saudi Arabia), 'ASG - KWT' (Kuwait), 'ASG - OM' (Oman), 'ASG - QAR' (Qatar), 'ASG - UAE' (UAE). Defaults to ASG (Saudi Arabia) when omitted.")]
+        public string Company { get; set; } = "";
+
         [Description("Transfer order number (No.) to post.")]
         public string TransferOrderNo { get; set; } = "";
 
