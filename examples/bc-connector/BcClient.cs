@@ -8,11 +8,17 @@ using VestedAI.ConnectorSdk.Errors;
 namespace BcConnector;
 
 // ---------------------------------------------------------------------------
-// Business Central client for the ASG AI Gateway — a single custom API endpoint
-// that routes every operation internally instead of exposing one OData entity
-// per object. The AL side (codeunit "ASG AI Gateway" behind API page
-// "ASG AI Gateway API") owns field names and business rules; this client just
-// posts {operation, payload} and unwraps the {success, data|error} envelope.
+// Business Central client for the ASG AI Gateway — a single endpoint that routes
+// every operation internally instead of exposing one OData entity per object.
+// The AL side (codeunit "ASG AI Gateway" behind API page "ASG AI Gateway API")
+// owns field names and business rules; this client just posts {operation, payload}
+// and unwraps the {success, data|error} envelope.
+//
+// Transport is the ODataV4 web-service endpoint (.../ODataV4), where the company
+// is addressed by name — Company('ASG') — and the gateway page is exposed as the
+// 'aiGateway' entity. (The /api/ namespace is an alternative, but requires API
+// Services to be enabled on the BC service instance; ODataV4 only needs OData
+// Services.) The bound action is NAV.executeOperation.
 //
 // The SDK instantiates tool handlers fresh per call via Activator.CreateInstance
 // and offers no DI container, so this client is a process-wide singleton built
@@ -21,20 +27,20 @@ namespace BcConnector;
 // ---------------------------------------------------------------------------
 
 /// <summary>
-/// Thin client for the ASG AI Gateway custom API, authenticated with
-/// NavUserPassword basic auth. Resolves the company and gateway-record ids once,
+/// Thin client for the ASG AI Gateway over ODataV4, authenticated with
+/// NavUserPassword basic auth. Resolves the singleton gateway-record id once,
 /// then invokes the bound action for each operation.
 /// </summary>
 internal static class BcClient
 {
-    private const string GatewayAction = "Microsoft.NAV.executeOperation";
+    private const string GatewayAction = "NAV.executeOperation";
+    private const string GatewayEntity = "aiGateway";
 
     private static HttpClient? _http;
-    private static string _apiBase = "";   // e.g. http://bc-host:7048/BC/api/asg/ai/v1.0
+    private static string _apiBase = "";   // e.g. https://bc-host:8048/BC/ODataV4
     private static string _company = "";
 
     // Resolved lazily on first use and cached for the process lifetime.
-    private static Guid _companyId = Guid.Empty;
     private static Guid _gatewayId = Guid.Empty;
     private static readonly SemaphoreSlim _initLock = new(1, 1);
 
@@ -53,7 +59,7 @@ internal static class BcClient
     /// </summary>
     public static void Configure()
     {
-        var baseUrl  = Require("BC_BASE_URL");   // e.g. http://bc-host:7048/BC/api/asg/ai/v1.0
+        var baseUrl  = Require("BC_BASE_URL");   // e.g. https://bc-host:8048/BC/ODataV4
         var company  = Require("BC_COMPANY");    // e.g. CRONUS International Ltd.
         var username = Require("BC_USERNAME");
         var password = Require("BC_PASSWORD");
@@ -115,7 +121,7 @@ internal static class BcClient
         // object is serialized to a string and nested inside the action body.
         var payloadJson = JsonSerializer.Serialize(args ?? new { }, JsonOpts);
         var body = JsonSerializer.Serialize(new { operation, payload = payloadJson });
-        var url = $"{_apiBase}/companies({_companyId:D})/aiGateways({_gatewayId:D})/{GatewayAction}";
+        var url = $"{_apiBase}/{CompanySegment()}/{GatewayEntity}({_gatewayId:D})/{GatewayAction}";
 
         using var response = await SendAsync(http, HttpMethod.Post, url, body, toolKey);
         var outer = await ReadJsonAsync(response, toolKey);
@@ -145,19 +151,18 @@ internal static class BcClient
     }
 
     // ---------------------------------------------------------------------------
-    // Id resolution (company + singleton gateway record), cached for the process.
+    // Id resolution (singleton gateway record), cached for the process. The company
+    // is addressed by name in the URL, so only the gateway record id is resolved.
     // ---------------------------------------------------------------------------
 
     private static async Task EnsureIdsAsync(string toolKey)
     {
-        if (_companyId != Guid.Empty && _gatewayId != Guid.Empty)
+        if (_gatewayId != Guid.Empty)
             return;
 
         await _initLock.WaitAsync();
         try
         {
-            if (_companyId == Guid.Empty)
-                _companyId = await ResolveCompanyIdAsync(toolKey);
             if (_gatewayId == Guid.Empty)
                 _gatewayId = await ResolveGatewayIdAsync(toolKey);
         }
@@ -167,28 +172,10 @@ internal static class BcClient
         }
     }
 
-    private static async Task<Guid> ResolveCompanyIdAsync(string toolKey)
-    {
-        var http = Ready(toolKey);
-        var filter = Uri.EscapeDataString($"name eq '{_company.Replace("'", "''")}'");
-        var url = $"{_apiBase}/companies?$filter={filter}&$top=1";
-
-        using var response = await SendAsync(http, HttpMethod.Get, url, body: null, toolKey);
-        var json = await ReadJsonAsync(response, toolKey);
-
-        if (TryFirstId(json, out var id))
-            return id;
-
-        throw new ToolValidationException(
-            toolKey,
-            $"No Business Central company named '{_company}' is exposed on the API. " +
-            "Check BC_COMPANY and that the company is API-enabled.");
-    }
-
     private static async Task<Guid> ResolveGatewayIdAsync(string toolKey)
     {
         var http = Ready(toolKey);
-        var url = $"{_apiBase}/companies({_companyId:D})/aiGateways?$top=1";
+        var url = $"{_apiBase}/{CompanySegment()}/{GatewayEntity}?$top=1";
 
         using var response = await SendAsync(http, HttpMethod.Get, url, body: null, toolKey);
         var json = await ReadJsonAsync(response, toolKey);
@@ -199,8 +186,14 @@ internal static class BcClient
         throw new ToolValidationException(
             toolKey,
             "The ASG AI Gateway record was not found in Business Central. Ensure the ASG " +
-            "Customization app is installed (its install/upgrade codeunit seeds the record).");
+            "Customization app is installed (its install/upgrade codeunit seeds the record), " +
+            $"and that BC_COMPANY ('{_company}') names a company exposed over ODataV4.");
     }
+
+    // OData company key segment, addressing the company by name: Company('ASG').
+    // The name is percent-encoded; an embedded apostrophe is OData-escaped ('').
+    private static string CompanySegment() =>
+        $"Company('{Uri.EscapeDataString(_company.Replace("'", "''"))}')";
 
     // Read value[0].id from an OData collection response as a Guid.
     private static bool TryFirstId(JsonElement json, out Guid id)
@@ -252,7 +245,8 @@ internal static class BcClient
         var reason = statusCode switch
         {
             HttpStatusCode.Unauthorized => "authentication failed — check BC_USERNAME / BC_PASSWORD",
-            HttpStatusCode.NotFound     => "endpoint not found — check BC_BASE_URL and that the ASG AI Gateway API is published",
+            HttpStatusCode.NotFound     => "endpoint not found — check BC_BASE_URL (.../ODataV4) and that OData Services are enabled on the BC instance",
+            HttpStatusCode.ServiceUnavailable => "service unavailable — the BC ODataV4 endpoint is not responding (OData Services may be disabled or the instance is restarting)",
             _                           => $"HTTP {(int)statusCode} {response.ReasonPhrase}",
         };
 

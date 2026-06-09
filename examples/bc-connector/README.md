@@ -2,10 +2,14 @@
 
 A runnable Vested AI connector for **on-prem Dynamics 365 Business Central**,
 demonstrating the core `VestedAI.ConnectorSdk` attribute API against a real ERP
-backend over OData V4 with NavUserPassword (basic auth).
+backend through a **single custom API endpoint** (the *ASG AI Gateway*) with
+NavUserPassword (basic auth).
 
-The connector ships four agents and thirteen tools that read and write Business
-Central data through its published OData V4 web services.
+The connector ships four agents and thirteen tools. Instead of one published page
+per object, every tool dispatches a named **operation** (`GetCustomer`,
+`CreateSalesOrder`, …) to one gateway endpoint in BC, which routes it internally
+and enforces business rules in AL. See the `ASG AI Gateway` AL extension's
+`README.md` for the BC-side objects and wire contract.
 
 ---
 
@@ -18,9 +22,10 @@ Central data through its published OData V4 web services.
 | POCO `Args` / `Result` with `[Description]` | `Tools.cs` |
 | `ToolHandler<TArgs, TResult>` base class | `Tools.cs` |
 | `ToolValidationException` for not-found / backend errors | `Tools.cs`, `BcClient.cs` |
-| Multi-row OData search (`contains`, `$top`, `$orderby`) returning a list result | `Tools.cs` |
-| Posting document lines via an OData navigation property | `BcClient.cs`, `Tools.cs` |
-| Calling a real backend (BC OData V4, basic auth) | `BcClient.cs` |
+| One tool → one named operation dispatched to a single endpoint | `Tools.cs` |
+| List results (search) returned as a typed `Result` from the gateway | `Tools.cs` |
+| Calling a single custom API endpoint (bound action, basic auth) | `BcClient.cs` |
+| Resolving the company id + gateway record id once and caching them | `BcClient.cs` |
 | Process-wide HTTP client built from env at startup | `BcClient.cs`, `Program.cs` |
 | `ConnectorHost.RunFromEnvironmentAsync` entrypoint | `Program.cs` |
 | Multi-stage Docker build (SDK → runtime base) | `Dockerfile` |
@@ -60,6 +65,11 @@ Central data through its published OData V4 web services.
 | `erp_bc.purchasing.create_purchase_order` | `write` | Create a purchase order header for a vendor; returns the generated order number |
 | `erp_bc.purchasing.add_purchase_order_line` | `write` | Add an item line (item No. + quantity) to an existing purchase order |
 | `erp_bc.purchasing.get_purchase_order` | `read` | Look up a purchase order by No.; returns vendor, status, dates, and total incl. VAT |
+| `erp_bc.inventory.create_transfer_order` | `write` | Create a transfer order header (from/to/in-transit locations); returns the generated number |
+| `erp_bc.inventory.add_transfer_order_line` | `write` | Add an item line (item No. + quantity) to an existing transfer order |
+| `erp_bc.inventory.get_transfer_order` | `read` | Look up a transfer order by No.; returns header (locations, status, dates) and all lines |
+| `erp_bc.inventory.find_transfer_orders` | `read` | List transfer orders, optionally filtered by source/destination location |
+| `erp_bc.inventory.post_transfer_order` | `write` | Post a transfer order's shipment and/or receipt (Ship \| Receive \| ShipAndReceive) |
 
 ---
 
@@ -68,14 +78,15 @@ Central data through its published OData V4 web services.
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8) (for `dotnet run`)
 - A Vested AI connector token and hub address (see the platform docs)
 - An on-prem Business Central instance with:
-  - **OData V4 web services enabled** on the BC Server instance.
+  - **API services enabled** on the BC Server instance (`ODataServicesEnabled` /
+    `ApiServicesEnabled` — both on by default).
   - **NavUserPassword** credential type (basic auth) configured.
-  - The pages used here published as web services with these service names:
-    `Customers`, `Vendors`, `Items`, `SalesOrder` and `PurchaseOrder` (each with its
-    lines subpage reachable through the `SalesOrderSalesLines` /
-    `PurchaseOrderPurchLines` navigation property), and `CustomerLedgerEntries`.
-    Adjust the entity-set names and field names in `Tools.cs` if your published
-    services differ.
+  - The **ASG AI Gateway** AL extension installed — a standalone app (publisher
+    `asg`, id range 52765–52800) that publishes the custom API (publisher `asg`,
+    group `ai`, version `v1.0`). Custom API pages are published automatically — no
+    manual Web Services registration is needed. The BC user must have permission to
+    read/write the Customer, Item, Vendor, Sales, Purchase and Cust. Ledger tables
+    the operations touch.
 
 ---
 
@@ -88,8 +99,8 @@ Copy `.env.example` to `.env` and fill in the values:
 | `VESTED_CONNECTOR_TOKEN` | yes | Connector JWT from the Vested AI platform |
 | `VESTED_CONNECTOR_HUB` | yes | Hub gRPC endpoint, `host:port` |
 | `LOG_LEVEL` | no | `Trace`…`Error` (default `Information`) |
-| `BC_BASE_URL` | yes | OData V4 base URL: `http(s)://<host>:<port>/<serverinstance>/ODataV4` |
-| `BC_COMPANY` | yes | Company name exactly as in BC (used in `Company('…')`) |
+| `BC_BASE_URL` | yes | Gateway API base URL: `http(s)://<host>:<port>/<serverinstance>/api/asg/ai/v1.0` |
+| `BC_COMPANY` | yes | Company name exactly as in BC (used to resolve the company id) |
 | `BC_USERNAME` | yes | BC user name |
 | `BC_PASSWORD` | yes | The user's **Web Service Access Key** (recommended) or password |
 | `BC_TIMEOUT_SECONDS` | no | Per-request HTTP timeout in seconds (default `30`) |
@@ -100,15 +111,32 @@ before connecting to the hub.
 
 ### How requests are formed
 
-Each tool call hits:
+On the first call, `BcClient` resolves two ids and caches them for the process:
 
 ```
-{BC_BASE_URL}/Company('{BC_COMPANY}')/{EntitySet}?{ODataQuery}
+GET {BC_BASE_URL}/companies?$filter=name eq '{BC_COMPANY}'&$top=1   → company id
+GET {BC_BASE_URL}/companies({companyId})/aiGateways?$top=1          → gateway record id
 ```
 
-for reads (`GET`), or `POST`s a JSON body to the same path (without the query)
-to create records. The `Authorization: Basic` header carries
-`base64(BC_USERNAME:BC_PASSWORD)`.
+Every tool then `POST`s its operation to the gateway's bound action:
+
+```
+POST {BC_BASE_URL}/companies({companyId})/aiGateways({gatewayId})/Microsoft.NAV.executeOperation
+Content-Type: application/json
+
+{ "operation": "GetCustomer", "payload": "{\"customerNo\":\"C00010\"}" }
+```
+
+`payload` is the tool's `args` serialized (camelCase) as a JSON **string**. BC
+returns the envelope as a string in OData's `value`:
+
+```
+{ "value": "{\"success\":true,\"data\":{ ... }}" }
+```
+
+`BcClient` parses `value`, checks `success`, throws `ToolValidationException` with
+`error` on failure, and otherwise deserializes `data` into the tool's `Result`.
+The `Authorization: Basic` header carries `base64(BC_USERNAME:BC_PASSWORD)`.
 
 ---
 
@@ -119,8 +147,8 @@ bc-connector/
 ├── BcConnector.csproj    # Exe project; references the SDK via ProjectReference
 ├── Program.cs            # BcClient.Configure() → ConnectorHost → RunFromEnvironmentAsync
 ├── Agents.cs             # [Agent] + [Instruction] declarations (4 agents)
-├── Tools.cs              # Thirteen [Tool] ToolHandler<,> implementations
-├── BcClient.cs           # Shared BC OData V4 client (basic auth; query / create / nested-create helpers)
+├── Tools.cs              # Thirteen [Tool] ToolHandler<,> implementations (each dispatches one operation)
+├── BcClient.cs           # Shared ASG AI Gateway client (basic auth; ExecuteAsync + id resolution)
 ├── .env.example          # Environment variable template
 ├── Dockerfile            # Multi-stage build (dotnet/sdk:8.0 → dotnet/runtime:8.0)
 └── README.md             # This file
@@ -197,17 +225,18 @@ For a local hub over plain HTTP, also call `.UseInsecureTransport()` in `Program
 
 #### `find_customers` (sensitivity: `read`)
 
-Searches customers by partial name via
-`GET Customers?$filter=contains(Name,'<text>')&$top=<n>&$orderby=Name`.
+Searches customers by partial name. Operation `FindCustomers` (case-insensitive
+`contains`, capped at `top`, ordered by name — applied in AL).
 
-**Args:** `nameContains` (string), `top` (int, 1–50, default 10).
+**Args:** `nameContains` (string, optional — omit to browse all), `top` (int, 1–50, default 10).
 **Result:** `count`, `customers[]` (each: `customerNo`, `name`, `city`, `balanceLcy`, `blocked`).
-**Behaviour:** returns an empty list (not an error) when nothing matches; throws
-`ToolValidationException` when `nameContains` is blank or on backend failure.
+**Behaviour:** when `nameContains` is blank the filter is skipped and the first page
+of customers (by name) is returned; returns an empty list (not an error) when nothing
+matches; throws `ToolValidationException` on backend failure.
 
 #### `get_customer` (sensitivity: `read`)
 
-Looks up a customer by number via `GET Customers?$filter=No eq '<no>'`.
+Looks up a customer by number. Operation `GetCustomer`.
 
 **Args:** `customerNo` (string).
 **Result:** `customerNo`, `name`, `email`, `phoneNo`, `balanceLcy`, `creditLimitLcy`, `blocked`.
@@ -215,17 +244,18 @@ Looks up a customer by number via `GET Customers?$filter=No eq '<no>'`.
 
 #### `create_sales_order` (sensitivity: `write`)
 
-Creates a sales order header via `POST SalesOrder` with `Sell_to_Customer_No`
-(and optional `External_Document_No`). The order has no lines until you add them.
+Creates a sales order header. Operation `CreateSalesOrder` (inserts a `Sales Header`
+of type `Order` and validates the sell-to customer in AL). The order has no lines
+until you add them.
 
 **Args:** `customerNo` (string), `externalDocumentNo` (string, optional).
 **Result:** `orderNo`, `customerNo`, `customerName`.
 
 #### `add_sales_order_line` (sensitivity: `write`)
 
-Adds an item line to an existing order via
-`POST SalesOrder(Document_Type='Order',No='<orderNo>')/SalesOrderSalesLines`
-with `Type='Item'`, `No`, `Quantity` (and optional `Location_Code`).
+Adds an item line to an existing order. Operation `AddSalesOrderLine` (inserts a
+`Sales Line` of type `Item` and validates `No.`, `Quantity` and optional
+`Location Code` in AL).
 
 **Args:** `orderNo` (string), `itemNo` (string), `quantity` (decimal > 0), `locationCode` (string, optional).
 **Result:** `orderNo`, `lineNo`, `itemNo`, `description`, `quantity`, `unitPrice`, `lineAmount`.
@@ -234,7 +264,7 @@ with `Type='Item'`, `No`, `Quantity` (and optional `Location_Code`).
 
 #### `get_sales_order` (sensitivity: `read`)
 
-Looks up an order header by number via `GET SalesOrder?$filter=No eq '<orderNo>'`.
+Looks up an order header by number. Operation `GetSalesOrder`.
 
 **Args:** `orderNo` (string).
 **Result:** `orderNo`, `customerNo`, `customerName`, `status`, `orderDate`, `externalDocumentNo`, `currencyCode`, `amountIncludingVat`.
@@ -244,16 +274,18 @@ Looks up an order header by number via `GET SalesOrder?$filter=No eq '<orderNo>'
 
 #### `find_items` (sensitivity: `read`)
 
-Searches items by partial description via
-`GET Items?$filter=contains(Description,'<text>')&$top=<n>&$orderby=Description`.
+Searches items by partial description. Operation `FindItems` (case-insensitive
+`contains`, capped at `top`, ordered by description — applied in AL).
 
-**Args:** `descriptionContains` (string), `top` (int, 1–50, default 10).
+**Args:** `descriptionContains` (string, optional — omit to browse all), `top` (int, 1–50, default 10).
 **Result:** `count`, `items[]` (each: `itemNo`, `description`, `unitPrice`, `inventory`).
-**Behaviour:** returns an empty list (not an error) when nothing matches.
+**Behaviour:** when `descriptionContains` is blank the filter is skipped and the first
+page of items (by description) is returned; returns an empty list (not an error) when
+nothing matches.
 
 #### `get_item` (sensitivity: `read`)
 
-Looks up an item by number via `GET Items?$filter=No eq '<no>'`.
+Looks up an item by number. Operation `GetItem`.
 
 **Args:** `itemNo` (string).
 **Result:** `itemNo`, `description`, `baseUnitOfMeasure`, `unitPrice`, `inventory`.
@@ -263,9 +295,10 @@ Looks up an item by number via `GET Items?$filter=No eq '<no>'`.
 
 #### `list_open_customer_entries` (sensitivity: `read`)
 
-Lists a customer's open ledger entries via
-`GET CustomerLedgerEntries?$filter=Customer_No eq '<no>' and Open eq true&$top=<n>&$orderby=Due_Date`.
-Each entry's `overdue` flag is computed connector-side (open **and** `Due_Date` in the past).
+Lists a customer's open ledger entries. Operation `ListOpenCustomerEntries`
+(filters open entries for the customer, capped at `top`). Each entry's `overdue`
+flag is computed in AL against the BC work/system date (open **and** due date in
+the past); `overdueOnly` filters to those.
 
 **Args:** `customerNo` (string), `overdueOnly` (bool, default false), `top` (int, 1–100, default 50).
 **Result:** `customerNo`, `count`, `totalRemainingLcy`, `entries[]` (each: `documentType`, `documentNo`, `postingDate`, `dueDate`, `remainingAmountLcy`, `overdue`).
@@ -278,16 +311,18 @@ of sales orders. Purchase lines carry a **direct unit cost** (what you pay), not
 
 #### `find_vendors` (sensitivity: `read`)
 
-Searches vendors by partial name via
-`GET Vendors?$filter=contains(Name,'<text>')&$top=<n>&$orderby=Name`.
+Searches vendors by partial name. Operation `FindVendors` (case-insensitive
+`contains`, capped at `top`, ordered by name — applied in AL).
 
-**Args:** `nameContains` (string), `top` (int, 1–50, default 10).
+**Args:** `nameContains` (string, optional — omit to browse all), `top` (int, 1–50, default 10).
 **Result:** `count`, `vendors[]` (each: `vendorNo`, `name`, `city`, `balanceLcy`, `blocked`).
-**Behaviour:** returns an empty list (not an error) when nothing matches.
+**Behaviour:** when `nameContains` is blank the filter is skipped and the first page
+of vendors (by name) is returned; returns an empty list (not an error) when nothing
+matches.
 
 #### `get_vendor` (sensitivity: `read`)
 
-Looks up a vendor by number via `GET Vendors?$filter=No eq '<no>'`.
+Looks up a vendor by number. Operation `GetVendor`.
 
 **Args:** `vendorNo` (string).
 **Result:** `vendorNo`, `name`, `email`, `phoneNo`, `balanceLcy`, `blocked`.
@@ -295,17 +330,18 @@ Looks up a vendor by number via `GET Vendors?$filter=No eq '<no>'`.
 
 #### `create_purchase_order` (sensitivity: `write`)
 
-Creates a purchase order header via `POST PurchaseOrder` with `Buy_from_Vendor_No`
-(and optional `Vendor_Invoice_No`). The order has no lines until you add them.
+Creates a purchase order header. Operation `CreatePurchaseOrder` (inserts a
+`Purchase Header` of type `Order` and validates the buy-from vendor in AL). The
+order has no lines until you add them.
 
 **Args:** `vendorNo` (string), `vendorInvoiceNo` (string, optional).
 **Result:** `orderNo`, `vendorNo`, `vendorName`.
 
 #### `add_purchase_order_line` (sensitivity: `write`)
 
-Adds an item line to an existing order via
-`POST PurchaseOrder(Document_Type='Order',No='<orderNo>')/PurchaseOrderPurchLines`
-with `Type='Item'`, `No`, `Quantity` (and optional `Location_Code`).
+Adds an item line to an existing order. Operation `AddPurchaseOrderLine` (inserts a
+`Purchase Line` of type `Item` and validates `No.`, `Quantity` and optional
+`Location Code` in AL).
 
 **Args:** `orderNo` (string), `itemNo` (string), `quantity` (decimal > 0), `locationCode` (string, optional).
 **Result:** `orderNo`, `lineNo`, `itemNo`, `description`, `quantity`, `directUnitCost`, `lineAmount`.
@@ -314,18 +350,70 @@ with `Type='Item'`, `No`, `Quantity` (and optional `Location_Code`).
 
 #### `get_purchase_order` (sensitivity: `read`)
 
-Looks up an order header by number via `GET PurchaseOrder?$filter=No eq '<orderNo>'`.
+Looks up an order header by number. Operation `GetPurchaseOrder`.
 
 **Args:** `orderNo` (string).
 **Result:** `orderNo`, `vendorNo`, `vendorName`, `status`, `orderDate`, `vendorInvoiceNo`, `currencyCode`, `amountIncludingVat`.
 **Error:** `ToolValidationException` when no order matches, or on backend failure.
 
-> Field names (`Sell_to_Customer_No`, `Buy_from_Vendor_No`, `Direct_Unit_Cost`,
-> `Balance_LCY`, `Remaining_Amt_LCY`, …) follow BC's OData convention of collapsing
-> runs of spaces and punctuation in a field caption to a single underscore. They match
-> the **standard** Customer / Vendor / Item / Sales Order / Purchase Order / Customer
-> Ledger Entries pages; verify them against your published web services if you have
-> customised those pages.
+### Inventory transfers — `erp_bc.inventory`
+
+A transfer order moves stock between two locations through an **in-transit** location:
+create the order, add lines, post the shipment (stock leaves the source into transit),
+then post the receipt (stock arrives at the destination).
+
+#### `create_transfer_order` (sensitivity: `write`)
+
+Creates a transfer order header. Operation `CreateTransferOrder` (inserts a
+`Transfer Header` and validates the from/to/in-transit locations in AL). The order
+has no lines until you add them.
+
+**Args:** `transferFromCode` (string), `transferToCode` (string), `inTransitCode` (string), `postingDate`/`shipmentDate`/`receiptDate` (string `yyyy-MM-dd`, optional), `externalDocumentNo` (string, optional).
+**Result:** `transferOrderNo`, `transferFromCode`, `transferFromName`, `transferToCode`, `transferToName`, `inTransitCode`, `status`, `postingDate`, `shipmentDate`, `receiptDate`, `externalDocumentNo`.
+**Error:** `ToolValidationException` on blank from/to/in-transit codes, or backend failure.
+
+#### `add_transfer_order_line` (sensitivity: `write`)
+
+Adds an item line to an existing transfer order. Operation `AddTransferOrderLine`
+(inserts a `Transfer Line` and validates `Item No.`, optional `Variant Code`, and
+`Quantity` in AL; locations come from the header).
+
+**Args:** `transferOrderNo` (string), `itemNo` (string), `quantity` (decimal > 0), `variantCode` (string, optional).
+**Result:** `transferOrderNo`, `lineNo`, `itemNo`, `variantCode`, `description`, `quantity`, `unitOfMeasureCode`, `qtyToShip`, `qtyToReceive`, `outstandingQuantity`.
+**Error:** `ToolValidationException` on blank args, non-positive quantity, or backend failure.
+
+#### `get_transfer_order` (sensitivity: `read`)
+
+Looks up a transfer order header and its lines by number. Operation `GetTransferOrder`.
+
+**Args:** `transferOrderNo` (string).
+**Result:** header fields (as in `create_transfer_order`) plus `lineCount` and `lines[]` (each: `lineNo`, `itemNo`, `variantCode`, `description`, `quantity`, `unitOfMeasureCode`, `qtyToShip`, `qtyShipped`, `qtyToReceive`, `qtyReceived`, `outstandingQuantity`).
+**Error:** `ToolValidationException` when no order matches, or on backend failure.
+
+#### `find_transfer_orders` (sensitivity: `read`)
+
+Lists transfer orders, optionally filtered by location. Operation `FindTransferOrders`
+(applies `Transfer-from Code` / `Transfer-to Code` ranges, capped at `top` — in AL).
+
+**Args:** `transferFromCode` (string, optional), `transferToCode` (string, optional), `top` (int, 1–50, default 10).
+**Result:** `count`, `transferOrders[]` (each: `transferOrderNo`, `transferFromCode`, `transferToCode`, `inTransitCode`, `status`, `postingDate`, `shipmentDate`, `receiptDate`, `externalDocumentNo`).
+**Behaviour:** when both location filters are blank, the first page of orders is returned; empty list (not an error) when nothing matches.
+
+#### `post_transfer_order` (sensitivity: `write`)
+
+Posts a transfer order's shipment and/or receipt. Operation `PostTransferOrder`
+(releases the order via `Release Transfer Document` when shipping an Open order, then
+runs `TransferOrder-Post Shipment` / `TransferOrder-Post Receipt` in AL).
+
+**Args:** `transferOrderNo` (string), `postType` (string: `Ship` | `Receive` | `ShipAndReceive`, default `ShipAndReceive`).
+**Result:** `transferOrderNo`, `postType`, `shipped` (bool), `received` (bool), `completed` (bool — true when the fully-posted order was removed), `status` (present only when the order still exists).
+**Error:** `ToolValidationException` on blank `transferOrderNo`, invalid `postType`, or a posting failure (e.g. insufficient inventory, closed posting period).
+
+> Field names are **stable, connector-facing camelCase** (`customerNo`, `balanceLcy`,
+> `directUnitCost`, `amountIncludingVat`, …) owned by the AL gateway — they do not
+> change when the underlying BC pages or tables change. The gateway maps them to the
+> real BC fields internally (see codeunit `ASG AI Gateway`). To add or rename a field,
+> change the gateway and the matching `Result` property together.
 
 ---
 
@@ -348,7 +436,7 @@ Run the image (pass every required variable):
 docker run --rm \
   -e VESTED_CONNECTOR_TOKEN=<your-token> \
   -e VESTED_CONNECTOR_HUB=hub.example.com:4443 \
-  -e BC_BASE_URL=http://bc-host:7048/BC/ODataV4 \
+  -e BC_BASE_URL=http://bc-host:7048/BC/api/asg/ai/v1.0 \
   -e BC_COMPANY='CRONUS International Ltd.' \
   -e BC_USERNAME=<bc-user> \
   -e BC_PASSWORD=<web-service-access-key> \
@@ -363,14 +451,17 @@ docker run --rm \
 
 ## Adapting / extending
 
-1. **Add more tools:** follow the `[Tool]` + `ToolHandler<,>` pattern and call
-   `BcClient.QueryAsync` / `FindOneAsync` / `CreateAsync`. The assembly scanner in
-   `ConnectorHost.ScanAssembly` picks them up automatically.
+1. **Add a new operation (the common case):** add a `case` branch + `Handle*`
+   procedure in the AL codeunit `ASG AI Gateway`, then add a matching `[Tool]` +
+   `ToolHandler<,>` here that calls `BcClient.ExecuteAsync<Result>("YourOp", args, key)`.
+   The assembly scanner in `ConnectorHost.ScanAssembly` picks the tool up
+   automatically. Keep the camelCase JSON keys in sync on both sides.
 2. **Add agents:** declare another `[Agent]`; remember tool keys must start with
    `<agentKey>.`.
-3. **Use the standard API instead of OData pages:** swap the URL builder in
-   `BcClient` to `…/api/v2.0/companies(<id>)/<entitySet>` and resolve the company
-   GUID at startup. The basic-auth header is identical.
+3. **Switch to OAuth (e.g. BC cloud):** the gateway is a standard API page, so the
+   same endpoint works with an OAuth bearer token — replace the `Basic` header in
+   `BcClient.Configure()` with a bearer token and point `BC_BASE_URL` at the cloud
+   `…/api/asg/ai/v1.0` base. The id-resolution and `ExecuteAsync` logic is unchanged.
 4. **Update `.env.example`** with any new variables.
 
 ---

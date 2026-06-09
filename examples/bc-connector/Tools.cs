@@ -172,13 +172,13 @@ public class CreateSalesOrder : ToolHandler<CreateSalesOrder.Args, CreateSalesOr
 /// </summary>
 [Tool(
     Key         = "erp_bc.sales.find_customers",
-    Description = "Search Business Central customers whose name contains the given text. Use when you have a customer's name but not their number (No.). Returns up to a configurable number of matches.",
+    Description = "Search Business Central customers whose name contains the given text. Use when you have a customer's name but not their number (No.). Omit nameContains to browse the first page of customers. Returns up to a configurable number of matches.",
     Sensitivity = "read")]
 public class FindCustomers : ToolHandler<FindCustomers.Args, FindCustomers.Result>
 {
     public class Args
     {
-        [Description("Text to search for within the customer name (case-insensitive substring).")]
+        [Description("Optional. Text to search for within the customer name (case-insensitive substring). Leave empty to list customers without filtering.")]
         public string NameContains { get; set; } = "";
 
         [Description("Maximum number of matches to return (1-50). Defaults to 10.")]
@@ -214,10 +214,6 @@ public class FindCustomers : ToolHandler<FindCustomers.Args, FindCustomers.Resul
 
     public override async Task<Result> HandleAsync(Args args, ToolContext ctx)
     {
-        if (string.IsNullOrWhiteSpace(args.NameContains))
-            throw new ToolValidationException(
-                "erp_bc.sales.find_customers", "nameContains is required.");
-
         return await BcClient.ExecuteAsync<Result>(
             "FindCustomers", args, "erp_bc.sales.find_customers");
     }
@@ -361,13 +357,13 @@ public class AddSalesOrderLine : ToolHandler<AddSalesOrderLine.Args, AddSalesOrd
 /// </summary>
 [Tool(
     Key         = "erp_bc.inventory.find_items",
-    Description = "Search Business Central items whose description contains the given text. Use when you have a product name but not its item number (No.). Returns up to a configurable number of matches.",
+    Description = "Search Business Central items whose description contains the given text. Use when you have a product name but not its item number (No.). Omit descriptionContains to browse the first page of items. Returns up to a configurable number of matches.",
     Sensitivity = "read")]
 public class FindItems : ToolHandler<FindItems.Args, FindItems.Result>
 {
     public class Args
     {
-        [Description("Text to search for within the item description (case-insensitive substring).")]
+        [Description("Optional. Text to search for within the item description (case-insensitive substring). Leave empty to list items without filtering.")]
         public string DescriptionContains { get; set; } = "";
 
         [Description("Maximum number of matches to return (1-50). Defaults to 10.")]
@@ -400,10 +396,6 @@ public class FindItems : ToolHandler<FindItems.Args, FindItems.Result>
 
     public override async Task<Result> HandleAsync(Args args, ToolContext ctx)
     {
-        if (string.IsNullOrWhiteSpace(args.DescriptionContains))
-            throw new ToolValidationException(
-                "erp_bc.inventory.find_items", "descriptionContains is required.");
-
         return await BcClient.ExecuteAsync<Result>(
             "FindItems", args, "erp_bc.inventory.find_items");
     }
@@ -493,13 +485,13 @@ public class ListOpenCustomerEntries
 /// </summary>
 [Tool(
     Key         = "erp_bc.purchasing.find_vendors",
-    Description = "Search Business Central vendors whose name contains the given text. Use when you have a vendor's name but not their number (No.). Returns up to a configurable number of matches.",
+    Description = "Search Business Central vendors whose name contains the given text. Use when you have a vendor's name but not their number (No.). Omit nameContains to browse the first page of vendors. Returns up to a configurable number of matches.",
     Sensitivity = "read")]
 public class FindVendors : ToolHandler<FindVendors.Args, FindVendors.Result>
 {
     public class Args
     {
-        [Description("Text to search for within the vendor name (case-insensitive substring).")]
+        [Description("Optional. Text to search for within the vendor name (case-insensitive substring). Leave empty to list vendors without filtering.")]
         public string NameContains { get; set; } = "";
 
         [Description("Maximum number of matches to return (1-50). Defaults to 10.")]
@@ -535,10 +527,6 @@ public class FindVendors : ToolHandler<FindVendors.Args, FindVendors.Result>
 
     public override async Task<Result> HandleAsync(Args args, ToolContext ctx)
     {
-        if (string.IsNullOrWhiteSpace(args.NameContains))
-            throw new ToolValidationException(
-                "erp_bc.purchasing.find_vendors", "nameContains is required.");
-
         return await BcClient.ExecuteAsync<Result>(
             "FindVendors", args, "erp_bc.purchasing.find_vendors");
     }
@@ -768,5 +756,415 @@ public class GetPurchaseOrder : ToolHandler<GetPurchaseOrder.Args, GetPurchaseOr
 
         return await BcClient.ExecuteAsync<Result>(
             "GetPurchaseOrder", args, "erp_bc.purchasing.get_purchase_order");
+    }
+}
+
+// ===========================================================================
+// Transfer Orders — move inventory between locations via an in-transit location.
+// Workflow: create order -> add lines -> post shipment (stock to in-transit) ->
+// post receipt (stock to destination). Read with get/find.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// bc.inventory.create_transfer_order
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// Creates a transfer order header that moves stock from one location to another
+/// through an in-transit location. Add lines with
+/// <see cref="AddTransferOrderLine"/>, then post with <see cref="PostTransferOrder"/>.
+/// </summary>
+[Tool(
+    Key         = "erp_bc.inventory.create_transfer_order",
+    Description = "Create a Business Central transfer order header to move inventory between two locations via an in-transit location. The order has no lines until you add them with add_transfer_order_line.",
+    Sensitivity = "write")]
+public class CreateTransferOrder : ToolHandler<CreateTransferOrder.Args, CreateTransferOrder.Result>
+{
+    public class Args
+    {
+        [Description("Source location code stock is transferred from (e.g. MAIN, BLUE).")]
+        public string TransferFromCode { get; set; } = "";
+
+        [Description("Destination location code stock is transferred to (e.g. EAST, RED).")]
+        public string TransferToCode { get; set; } = "";
+
+        [Description("In-transit location code that holds stock between shipment and receipt (e.g. OWN LOG, TRANSIT).")]
+        public string InTransitCode { get; set; } = "";
+
+        [Description("Optional posting date (yyyy-MM-dd). Defaults to the BC work date when omitted.")]
+        public string PostingDate { get; set; } = "";
+
+        [Description("Optional shipment date (yyyy-MM-dd).")]
+        public string ShipmentDate { get; set; } = "";
+
+        [Description("Optional receipt date (yyyy-MM-dd).")]
+        public string ReceiptDate { get; set; } = "";
+
+        [Description("Optional external document number for cross-referencing.")]
+        public string ExternalDocumentNo { get; set; } = "";
+    }
+
+    public class Result
+    {
+        [Description("Transfer order number (No.) assigned by Business Central.")]
+        public string TransferOrderNo { get; set; } = "";
+
+        [Description("Source location code.")]
+        public string TransferFromCode { get; set; } = "";
+
+        [Description("Source location name.")]
+        public string TransferFromName { get; set; } = "";
+
+        [Description("Destination location code.")]
+        public string TransferToCode { get; set; } = "";
+
+        [Description("Destination location name.")]
+        public string TransferToName { get; set; } = "";
+
+        [Description("In-transit location code.")]
+        public string InTransitCode { get; set; } = "";
+
+        [Description("Order status (Open or Released).")]
+        public string Status { get; set; } = "";
+
+        [Description("Posting date (yyyy-MM-dd), or empty if unset.")]
+        public string PostingDate { get; set; } = "";
+
+        [Description("Shipment date (yyyy-MM-dd), or empty if unset.")]
+        public string ShipmentDate { get; set; } = "";
+
+        [Description("Receipt date (yyyy-MM-dd), or empty if unset.")]
+        public string ReceiptDate { get; set; } = "";
+
+        [Description("External document number.")]
+        public string ExternalDocumentNo { get; set; } = "";
+    }
+
+    public override async Task<Result> HandleAsync(Args args, ToolContext ctx)
+    {
+        if (string.IsNullOrWhiteSpace(args.TransferFromCode))
+            throw new ToolValidationException(
+                "erp_bc.inventory.create_transfer_order", "transferFromCode is required.");
+        if (string.IsNullOrWhiteSpace(args.TransferToCode))
+            throw new ToolValidationException(
+                "erp_bc.inventory.create_transfer_order", "transferToCode is required.");
+        if (string.IsNullOrWhiteSpace(args.InTransitCode))
+            throw new ToolValidationException(
+                "erp_bc.inventory.create_transfer_order", "inTransitCode is required.");
+
+        return await BcClient.ExecuteAsync<Result>(
+            "CreateTransferOrder", args, "erp_bc.inventory.create_transfer_order");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bc.inventory.add_transfer_order_line
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// Adds an item line to an existing transfer order.
+/// </summary>
+[Tool(
+    Key         = "erp_bc.inventory.add_transfer_order_line",
+    Description = "Add an item line to an existing Business Central transfer order. The from/to locations come from the order header.",
+    Sensitivity = "write")]
+public class AddTransferOrderLine : ToolHandler<AddTransferOrderLine.Args, AddTransferOrderLine.Result>
+{
+    public class Args
+    {
+        [Description("Transfer order number (No.) to add the line to.")]
+        public string TransferOrderNo { get; set; } = "";
+
+        [Description("Item number (No.) to transfer.")]
+        public string ItemNo { get; set; } = "";
+
+        [Description("Quantity to transfer. Must be greater than zero.")]
+        public decimal Quantity { get; set; }
+
+        [Description("Optional item variant code. Leave empty if the item has no variants.")]
+        public string VariantCode { get; set; } = "";
+    }
+
+    public class Result
+    {
+        [Description("Transfer order number the line belongs to.")]
+        public string TransferOrderNo { get; set; } = "";
+
+        [Description("Line number assigned by Business Central.")]
+        public int LineNo { get; set; }
+
+        [Description("Item number on the line.")]
+        public string ItemNo { get; set; } = "";
+
+        [Description("Item variant code, if any.")]
+        public string VariantCode { get; set; } = "";
+
+        [Description("Item description copied from the item card.")]
+        public string Description { get; set; } = "";
+
+        [Description("Quantity to transfer.")]
+        public decimal Quantity { get; set; }
+
+        [Description("Unit of measure code.")]
+        public string UnitOfMeasureCode { get; set; } = "";
+
+        [Description("Quantity scheduled to ship.")]
+        public decimal QtyToShip { get; set; }
+
+        [Description("Quantity scheduled to receive.")]
+        public decimal QtyToReceive { get; set; }
+
+        [Description("Quantity not yet fully shipped and received.")]
+        public decimal OutstandingQuantity { get; set; }
+    }
+
+    public override async Task<Result> HandleAsync(Args args, ToolContext ctx)
+    {
+        if (string.IsNullOrWhiteSpace(args.TransferOrderNo))
+            throw new ToolValidationException(
+                "erp_bc.inventory.add_transfer_order_line", "transferOrderNo is required.");
+        if (string.IsNullOrWhiteSpace(args.ItemNo))
+            throw new ToolValidationException(
+                "erp_bc.inventory.add_transfer_order_line", "itemNo is required.");
+        if (args.Quantity <= 0)
+            throw new ToolValidationException(
+                "erp_bc.inventory.add_transfer_order_line", "quantity must be greater than zero.");
+
+        return await BcClient.ExecuteAsync<Result>(
+            "AddTransferOrderLine", args, "erp_bc.inventory.add_transfer_order_line");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bc.inventory.get_transfer_order
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// Looks up a transfer order header and its lines by number.
+/// </summary>
+[Tool(
+    Key         = "erp_bc.inventory.get_transfer_order",
+    Description = "Look up a Business Central transfer order by its number (No.). Returns the header (locations, status, dates) and all lines with shipped/received quantities.",
+    Sensitivity = "read")]
+public class GetTransferOrder : ToolHandler<GetTransferOrder.Args, GetTransferOrder.Result>
+{
+    public class Args
+    {
+        [Description("Transfer order number (No.), e.g. 1001.")]
+        public string TransferOrderNo { get; set; } = "";
+    }
+
+    public class Line
+    {
+        [Description("Line number.")]
+        public int LineNo { get; set; }
+
+        [Description("Item number.")]
+        public string ItemNo { get; set; } = "";
+
+        [Description("Item variant code, if any.")]
+        public string VariantCode { get; set; } = "";
+
+        [Description("Item description.")]
+        public string Description { get; set; } = "";
+
+        [Description("Quantity to transfer.")]
+        public decimal Quantity { get; set; }
+
+        [Description("Unit of measure code.")]
+        public string UnitOfMeasureCode { get; set; } = "";
+
+        [Description("Quantity scheduled to ship.")]
+        public decimal QtyToShip { get; set; }
+
+        [Description("Quantity already shipped.")]
+        public decimal QtyShipped { get; set; }
+
+        [Description("Quantity scheduled to receive.")]
+        public decimal QtyToReceive { get; set; }
+
+        [Description("Quantity already received.")]
+        public decimal QtyReceived { get; set; }
+
+        [Description("Quantity not yet fully shipped and received.")]
+        public decimal OutstandingQuantity { get; set; }
+    }
+
+    public class Result
+    {
+        [Description("Transfer order number (No.).")]
+        public string TransferOrderNo { get; set; } = "";
+
+        [Description("Source location code.")]
+        public string TransferFromCode { get; set; } = "";
+
+        [Description("Source location name.")]
+        public string TransferFromName { get; set; } = "";
+
+        [Description("Destination location code.")]
+        public string TransferToCode { get; set; } = "";
+
+        [Description("Destination location name.")]
+        public string TransferToName { get; set; } = "";
+
+        [Description("In-transit location code.")]
+        public string InTransitCode { get; set; } = "";
+
+        [Description("Order status (Open or Released).")]
+        public string Status { get; set; } = "";
+
+        [Description("Posting date (yyyy-MM-dd), or empty if unset.")]
+        public string PostingDate { get; set; } = "";
+
+        [Description("Shipment date (yyyy-MM-dd), or empty if unset.")]
+        public string ShipmentDate { get; set; } = "";
+
+        [Description("Receipt date (yyyy-MM-dd), or empty if unset.")]
+        public string ReceiptDate { get; set; } = "";
+
+        [Description("External document number.")]
+        public string ExternalDocumentNo { get; set; } = "";
+
+        [Description("Number of lines on the order.")]
+        public int LineCount { get; set; }
+
+        [Description("Transfer order lines.")]
+        public List<Line> Lines { get; set; } = new();
+    }
+
+    public override async Task<Result> HandleAsync(Args args, ToolContext ctx)
+    {
+        if (string.IsNullOrWhiteSpace(args.TransferOrderNo))
+            throw new ToolValidationException(
+                "erp_bc.inventory.get_transfer_order", "transferOrderNo is required.");
+
+        return await BcClient.ExecuteAsync<Result>(
+            "GetTransferOrder", args, "erp_bc.inventory.get_transfer_order");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bc.inventory.find_transfer_orders
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// Lists transfer orders, optionally filtered by source/destination location.
+/// </summary>
+[Tool(
+    Key         = "erp_bc.inventory.find_transfer_orders",
+    Description = "List Business Central transfer orders, optionally filtered by source and/or destination location. Omit both filters to browse the first page. Returns up to a configurable number of matches.",
+    Sensitivity = "read")]
+public class FindTransferOrders : ToolHandler<FindTransferOrders.Args, FindTransferOrders.Result>
+{
+    public class Args
+    {
+        [Description("Optional source location code to filter by. Leave empty to include all.")]
+        public string TransferFromCode { get; set; } = "";
+
+        [Description("Optional destination location code to filter by. Leave empty to include all.")]
+        public string TransferToCode { get; set; } = "";
+
+        [Description("Maximum number of matches to return (1-50). Defaults to 10.")]
+        public int Top { get; set; } = 10;
+    }
+
+    public class Match
+    {
+        [Description("Transfer order number (No.).")]
+        public string TransferOrderNo { get; set; } = "";
+
+        [Description("Source location code.")]
+        public string TransferFromCode { get; set; } = "";
+
+        [Description("Destination location code.")]
+        public string TransferToCode { get; set; } = "";
+
+        [Description("In-transit location code.")]
+        public string InTransitCode { get; set; } = "";
+
+        [Description("Order status (Open or Released).")]
+        public string Status { get; set; } = "";
+
+        [Description("Posting date (yyyy-MM-dd), or empty if unset.")]
+        public string PostingDate { get; set; } = "";
+
+        [Description("Shipment date (yyyy-MM-dd), or empty if unset.")]
+        public string ShipmentDate { get; set; } = "";
+
+        [Description("Receipt date (yyyy-MM-dd), or empty if unset.")]
+        public string ReceiptDate { get; set; } = "";
+
+        [Description("External document number.")]
+        public string ExternalDocumentNo { get; set; } = "";
+    }
+
+    public class Result
+    {
+        [Description("Number of transfer orders returned.")]
+        public int Count { get; set; }
+
+        [Description("Matching transfer orders. Empty when nothing matched.")]
+        public List<Match> TransferOrders { get; set; } = new();
+    }
+
+    public override async Task<Result> HandleAsync(Args args, ToolContext ctx)
+    {
+        return await BcClient.ExecuteAsync<Result>(
+            "FindTransferOrders", args, "erp_bc.inventory.find_transfer_orders");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bc.inventory.post_transfer_order
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// Posts a transfer order's shipment and/or receipt. Releases the order first
+/// when shipping an Open order.
+/// </summary>
+[Tool(
+    Key         = "erp_bc.inventory.post_transfer_order",
+    Description = "Post a Business Central transfer order. postType 'Ship' moves stock from the source into the in-transit location, 'Receive' moves it from in-transit to the destination, and 'ShipAndReceive' (default) does both. Shipping releases the order first when needed.",
+    Sensitivity = "write")]
+public class PostTransferOrder : ToolHandler<PostTransferOrder.Args, PostTransferOrder.Result>
+{
+    public class Args
+    {
+        [Description("Transfer order number (No.) to post.")]
+        public string TransferOrderNo { get; set; } = "";
+
+        [Description("What to post: 'Ship', 'Receive', or 'ShipAndReceive'. Defaults to 'ShipAndReceive'.")]
+        public string PostType { get; set; } = "ShipAndReceive";
+    }
+
+    public class Result
+    {
+        [Description("Transfer order number that was posted.")]
+        public string TransferOrderNo { get; set; } = "";
+
+        [Description("The post type that was applied.")]
+        public string PostType { get; set; } = "";
+
+        [Description("Whether a shipment was posted.")]
+        public bool Shipped { get; set; }
+
+        [Description("Whether a receipt was posted.")]
+        public bool Received { get; set; }
+
+        [Description("True when the order was fully posted and removed (no remaining quantity).")]
+        public bool Completed { get; set; }
+
+        [Description("Order status after posting (present only when the order still exists).")]
+        public string Status { get; set; } = "";
+    }
+
+    public override async Task<Result> HandleAsync(Args args, ToolContext ctx)
+    {
+        if (string.IsNullOrWhiteSpace(args.TransferOrderNo))
+            throw new ToolValidationException(
+                "erp_bc.inventory.post_transfer_order", "transferOrderNo is required.");
+
+        return await BcClient.ExecuteAsync<Result>(
+            "PostTransferOrder", args, "erp_bc.inventory.post_transfer_order");
     }
 }
