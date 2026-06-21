@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using VestedAI.ConnectorSdk.Errors;
+using VestedAI.ConnectorSdk.Tool;
 
 namespace BcConnector;
 
@@ -31,9 +32,10 @@ namespace BcConnector;
 /// <summary>
 /// Thin client for the ASG AI Gateway over ODataV4, authenticated with
 /// NavUserPassword basic auth. Each call may target a specific BC company
-/// (tools expose an optional <c>company</c> arg); when none is given the
-/// default company from BC_COMPANY is used. The singleton gateway-record id is
-/// resolved and cached per company.
+/// (tools expose an optional <c>country</c> arg); when none is given the
+/// default from <see cref="BcCompanyRegistry"/> / BC_COMPANY is used.
+/// The gateway-record id is taken from BC_COMPANY_MAP when configured,
+/// otherwise resolved via OData and cached per company.
 /// </summary>
 internal static class BcClient
 {
@@ -42,7 +44,7 @@ internal static class BcClient
 
     private static HttpClient? _http;
     private static string _apiBase = "";          // e.g. https://bc-host:8048/BC/ODataV4
-    private static string _defaultCompany = "";   // from BC_COMPANY, used when a call omits 'company'
+    private static string _defaultCompany = "";   // from BC_COMPANY, used when routing falls back
 
     // Gateway record id per company, resolved lazily and cached for the process lifetime.
     private static readonly ConcurrentDictionary<string, Guid> _gatewayIds = new();
@@ -55,6 +57,8 @@ internal static class BcClient
         PropertyNameCaseInsensitive = true,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
+
+    internal static JsonSerializerOptions JsonOptions => JsonOpts;
 
     /// <summary>
     /// Read and validate BC_* environment variables and build the shared HttpClient.
@@ -70,6 +74,10 @@ internal static class BcClient
 
         _apiBase = baseUrl.TrimEnd('/');
         _defaultCompany = company;
+
+        BcCompanyRegistry.Configure(
+            company,
+            Environment.GetEnvironmentVariable("BC_COMPANY_MAP"));
 
         var timeoutSeconds = int.TryParse(
             Environment.GetEnvironmentVariable("BC_TIMEOUT_SECONDS"), out var t) ? t : 30;
@@ -87,6 +95,18 @@ internal static class BcClient
             new MediaTypeWithQualityHeaderValue("application/json"));
 
         _http = http;
+
+        var accessible = ProbeAccessibleCompanies(http);
+        if (accessible.Count > 0)
+        {
+            var removed = BcCompanyRegistry.RestrictToAccessibleCompanies(accessible);
+            if (removed.Count > 0)
+            {
+                Console.WriteLine(
+                    $"[bc] User '{username}' cannot access: {string.Join(", ", removed)}. " +
+                    $"Active countries: {BcCompanyRegistry.SupportedCountries}.");
+            }
+        }
     }
 
     /// <summary>
@@ -97,9 +117,10 @@ internal static class BcClient
     public static async Task<TResult> ExecuteAsync<TResult>(
         string operation,
         object args,
-        string toolKey)
+        string toolKey,
+        ToolContext ctx)
     {
-        var data = await ExecuteAsync(operation, args, toolKey);
+        var data = await ExecuteAsync(operation, args, toolKey, ctx);
         var result = data.Deserialize<TResult>(JsonOpts);
         if (result is null)
             throw new ToolValidationException(
@@ -116,18 +137,22 @@ internal static class BcClient
     public static async Task<JsonElement> ExecuteAsync(
         string operation,
         object args,
-        string toolKey)
+        string toolKey,
+        ToolContext ctx)
     {
         var http = Ready(toolKey);
 
-        // 'company' is a routing field (selects the BC company in the URL), not part
-        // of the operation payload — split it out before building the body.
-        var (company, payloadJson) = SplitCompany(args);
+        var (company, payloadJson) = await BuildPayloadAsync(args, toolKey, ctx, resolveStores: true, operation);
         var gatewayId = await ResolveGatewayIdAsync(company, toolKey);
+
+        // callerContext carries the authenticated caller identity (from ToolContext,
+        // not from args) in its own action field, kept separate from the payload so
+        // model-supplied args can never reach or spoof it.
+        var callerContext = BcCallerContext.Serialize(ctx);
 
         // payload is a JSON string parameter on the AL bound action, so the args
         // object is serialized to a string and nested inside the action body.
-        var body = JsonSerializer.Serialize(new { operation, payload = payloadJson });
+        var body = JsonSerializer.Serialize(new { operation, payload = payloadJson, callerContext });
         var url = $"{_apiBase}/{CompanySegment(company)}/{GatewayEntity}({gatewayId:D})/{GatewayAction}";
 
         using var response = await SendAsync(http, HttpMethod.Post, url, body, toolKey);
@@ -147,14 +172,100 @@ internal static class BcClient
         if (!success)
         {
             var error = root.TryGetProperty("error", out var e) ? e.GetString() : null;
-            throw new ToolValidationException(
-                toolKey,
-                string.IsNullOrWhiteSpace(error)
-                    ? $"Business Central rejected operation '{operation}'."
-                    : error!);
+            throw new ToolValidationException(toolKey, DescribeGatewayError(operation, error));
         }
 
         return root.TryGetProperty("data", out var data) ? data.Clone() : default;
+    }
+
+    /// <summary>
+    /// Gateway call used internally (e.g. store resolution) without re-entering store lookup.
+    /// </summary>
+    internal static async Task<JsonElement> ExecuteGatewayAsync(
+        string operation,
+        object args,
+        string company,
+        string toolKey,
+        ToolContext ctx)
+    {
+        var http = Ready(toolKey);
+        var (_, payloadJson) = await BuildPayloadAsync(
+            args, toolKey, ctx, resolveStores: false, operation, companyOverride: company);
+        var gatewayId = await ResolveGatewayIdAsync(company, toolKey);
+        var callerContext = BcCallerContext.Serialize(ctx);
+        var body = JsonSerializer.Serialize(new { operation, payload = payloadJson, callerContext });
+        var url = $"{_apiBase}/{CompanySegment(company)}/{GatewayEntity}({gatewayId:D})/{GatewayAction}";
+
+        using var response = await SendAsync(http, HttpMethod.Post, url, body, toolKey);
+        var outer = await ReadJsonAsync(response, toolKey);
+
+        if (!outer.TryGetProperty("value", out var valueEl) ||
+            valueEl.ValueKind != JsonValueKind.String)
+            throw new ToolValidationException(
+                toolKey, "Unexpected response from the BC gateway (missing string 'value').");
+
+        using var inner = JsonDocument.Parse(valueEl.GetString()!);
+        var root = inner.RootElement;
+
+        var success = root.TryGetProperty("success", out var s) &&
+                      s.ValueKind == JsonValueKind.True;
+        if (!success)
+        {
+            var error = root.TryGetProperty("error", out var e) ? e.GetString() : null;
+            throw new ToolValidationException(toolKey, DescribeGatewayError(operation, error));
+        }
+
+        return root.TryGetProperty("data", out var data) ? data.Clone() : default;
+    }
+
+    private static async Task<(string company, string payloadJson)> BuildPayloadAsync(
+        object args,
+        string toolKey,
+        ToolContext ctx,
+        bool resolveStores,
+        string operation,
+        string? companyOverride = null)
+    {
+        var node = JsonSerializer.SerializeToNode(args ?? new { }, JsonOpts)?.AsObject()
+                   ?? new JsonObject();
+
+        var company = companyOverride ?? ResolveCompanyFromRouting(node, toolKey);
+
+        if (resolveStores &&
+            !operation.Equals("FindStores", StringComparison.OrdinalIgnoreCase))
+        {
+            await BcStoreResolver.ResolveInPayloadAsync(node, company, toolKey, ctx);
+        }
+
+        RemoveRoutingKey(node, "country");
+        RemoveRoutingKey(node, "company");
+
+        return (company, node.ToJsonString(JsonOpts));
+    }
+
+    // Turn a raw gateway error into an actionable tool message. When the gateway
+    // does not implement the requested operation, the failure is permanent for this
+    // environment (the AL app would need to be updated), so we say so plainly and
+    // tell the caller not to retry — otherwise the model burns repeated calls (and
+    // eventually a timeout) re-invoking a tool that can never succeed here.
+    private static string DescribeGatewayError(string operation, string? error)
+    {
+        if (string.IsNullOrWhiteSpace(error))
+            return $"Business Central rejected operation '{operation}'.";
+
+        var trimmed = error.Trim();
+        if (trimmed.Contains("Unknown operation", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("not implemented", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("not supported", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"This capability is not available in the connected Business Central " +
+                   $"environment — the gateway does not implement operation '{operation}'. " +
+                   $"This is a permanent limitation, not a transient error: do not retry. " +
+                   $"Tell the user the requested lookup is not supported here. " +
+                   $"(Gateway said: {trimmed})";
+        }
+
+        return trimmed;
     }
 
     // ---------------------------------------------------------------------------
@@ -162,26 +273,63 @@ internal static class BcClient
     // the singleton gateway-record id is resolved once per company and cached.
     // ---------------------------------------------------------------------------
 
-    // Extract the optional 'company' field from the args and return it alongside the
-    // remaining payload JSON (with 'company' removed). Falls back to the default
-    // company from BC_COMPANY when the field is absent or blank.
-    private static (string company, string payloadJson) SplitCompany(object args)
+    private static string ResolveCompanyFromRouting(JsonObject node, string toolKey)
     {
-        var node = JsonSerializer.SerializeToNode(args ?? new { }, JsonOpts)?.AsObject()
-                   ?? new JsonObject();
+        var inferredCountry = BcCountryInference.InferFromPayload(node);
 
-        var company = _defaultCompany;
-        var key = node.FirstOrDefault(
-            p => string.Equals(p.Key, "company", StringComparison.OrdinalIgnoreCase)).Key;
-        if (key is not null)
+        var countryKey = node.FirstOrDefault(
+            p => string.Equals(p.Key, "country", StringComparison.OrdinalIgnoreCase)).Key;
+        if (countryKey is not null)
         {
-            var value = node[key]?.GetValue<string>();
-            if (!string.IsNullOrWhiteSpace(value))
-                company = value.Trim();
-            node.Remove(key);
+            var country = node[countryKey]?.GetValue<string>()?.Trim();
+            if (!string.IsNullOrWhiteSpace(country))
+            {
+                if (BcCountryInference.ShouldOverrideExplicitCountry(country, inferredCountry))
+                {
+                    Console.WriteLine(
+                        $"[bc] Routing {toolKey}: country '{country}' overridden to " +
+                        $"'{inferredCountry}' from entity number.");
+                    country = inferredCountry!;
+                }
+
+                if (BcCompanyRegistry.TryResolveByCountry(country, out var entry))
+                    return entry.CompanyName;
+
+                throw new ToolValidationException(
+                    toolKey,
+                    $"Unknown country '{country}'. Supported codes: {BcCompanyRegistry.SupportedCountries}.");
+            }
         }
 
-        return (company, node.ToJsonString(JsonOpts));
+        var companyKey = node.FirstOrDefault(
+            p => string.Equals(p.Key, "company", StringComparison.OrdinalIgnoreCase)).Key;
+        if (companyKey is not null)
+        {
+            var legacyCompany = node[companyKey]?.GetValue<string>()?.Trim();
+            if (!string.IsNullOrWhiteSpace(legacyCompany))
+            {
+                if (BcCompanyRegistry.TryResolveByCompany(legacyCompany, out var entry))
+                    return entry.CompanyName;
+                return legacyCompany;
+            }
+        }
+
+        if (inferredCountry is not null &&
+            BcCompanyRegistry.TryResolveByCountry(inferredCountry, out var inferredEntry))
+            return inferredEntry.CompanyName;
+
+        if (BcCompanyRegistry.TryResolveByCompany(_defaultCompany, out var defaultEntry))
+            return defaultEntry.CompanyName;
+
+        return _defaultCompany;
+    }
+
+    private static void RemoveRoutingKey(JsonObject node, string name)
+    {
+        var key = node.FirstOrDefault(
+            p => string.Equals(p.Key, name, StringComparison.OrdinalIgnoreCase)).Key;
+        if (key is not null)
+            node.Remove(key);
     }
 
     private static async Task<Guid> ResolveGatewayIdAsync(string company, string toolKey)
@@ -189,11 +337,25 @@ internal static class BcClient
         if (_gatewayIds.TryGetValue(company, out var cached))
             return cached;
 
+        var configured = BcCompanyRegistry.GetConfiguredGatewayId(company);
+        if (configured is Guid preconfigured)
+        {
+            _gatewayIds[company] = preconfigured;
+            return preconfigured;
+        }
+
         await _initLock.WaitAsync();
         try
         {
             if (_gatewayIds.TryGetValue(company, out cached))
                 return cached;
+
+            configured = BcCompanyRegistry.GetConfiguredGatewayId(company);
+            if (configured is Guid lockedPreconfigured)
+            {
+                _gatewayIds[company] = lockedPreconfigured;
+                return lockedPreconfigured;
+            }
 
             var http = Ready(toolKey);
             var url = $"{_apiBase}/{CompanySegment(company)}/{GatewayEntity}?$top=1";
@@ -223,6 +385,41 @@ internal static class BcClient
     // The name is percent-encoded; an embedded apostrophe is OData-escaped ('').
     private static string CompanySegment(string company) =>
         $"Company('{Uri.EscapeDataString(company.Replace("'", "''"))}')";
+
+    private static HashSet<string> ProbeAccessibleCompanies(HttpClient http)
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var url = $"{_apiBase}/Company";
+
+        try
+        {
+            using var response = http.GetAsync(url).GetAwaiter().GetResult();
+            if (!response.IsSuccessStatusCode)
+                return names;
+
+            var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            using var doc = JsonDocument.Parse(text);
+            if (!doc.RootElement.TryGetProperty("value", out var arr) ||
+                arr.ValueKind != JsonValueKind.Array)
+                return names;
+
+            foreach (var item in arr.EnumerateArray())
+            {
+                if (item.TryGetProperty("Name", out var nameEl))
+                {
+                    var name = nameEl.GetString();
+                    if (!string.IsNullOrWhiteSpace(name))
+                        names.Add(name);
+                }
+            }
+        }
+        catch
+        {
+            // Keep the configured map when the probe cannot run.
+        }
+
+        return names;
+    }
 
     // Read value[0].id from an OData collection response as a Guid.
     private static bool TryFirstId(JsonElement json, out Guid id)
@@ -271,11 +468,14 @@ internal static class BcClient
         var statusCode = response.StatusCode;
         response.Dispose();
 
+        var bcMessage = TryExtractBcErrorMessage(detail);
         var reason = statusCode switch
         {
             HttpStatusCode.Unauthorized => "authentication failed — check BC_USERNAME / BC_PASSWORD",
             HttpStatusCode.NotFound     => "endpoint not found — check BC_BASE_URL (.../ODataV4) and that OData Services are enabled on the BC instance",
             HttpStatusCode.ServiceUnavailable => "service unavailable — the BC ODataV4 endpoint is not responding (OData Services may be disabled or the instance is restarting)",
+            HttpStatusCode.BadRequest when bcMessage.Contains("Access is denied to company", StringComparison.OrdinalIgnoreCase)
+                => bcMessage.TrimEnd('.'),
             _                           => $"HTTP {(int)statusCode} {response.ReasonPhrase}",
         };
 
@@ -302,6 +502,25 @@ internal static class BcClient
             throw new ToolValidationException(
                 toolKey, "Business Central returned a non-JSON response.", ex);
         }
+    }
+
+    private static string TryExtractBcErrorMessage(string detail)
+    {
+        if (string.IsNullOrWhiteSpace(detail))
+            return "";
+
+        try
+        {
+            using var doc = JsonDocument.Parse(detail);
+            if (doc.RootElement.TryGetProperty("error", out var error) &&
+                error.TryGetProperty("message", out var message))
+                return message.GetString() ?? "";
+        }
+        catch (JsonException)
+        {
+        }
+
+        return "";
     }
 
     private static async Task<string> SafeReadAsync(HttpResponseMessage response)

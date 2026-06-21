@@ -11,6 +11,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="VestedAI.ConnectorSdk" Version="0.2.0" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.1" />
+    <PackageReference Include="Microsoft.SqlServer.TransactSql.ScriptDom" Version="180.37.3" />
+    <PackageReference Include="VestedAI.ConnectorSdk" Version="0.2.1" />
   </ItemGroup>
 </Project>
