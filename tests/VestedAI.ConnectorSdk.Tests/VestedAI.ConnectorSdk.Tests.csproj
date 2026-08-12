@@ -20,4 +20,13 @@
   <ItemGroup>
     <ProjectReference Include="../../src/VestedAI.ConnectorSdk/VestedAI.ConnectorSdk.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- The cross-SDK fixture, from THIS SDK's own testdata/ — these SDKs are
+         published as standalone repos, where a path outside the SDK root does
+         not exist. It is a generated copy of the canonical
+         vested-ai-sdks/testdata one; never hand-edit it. -->
+    <Content Include="../../testdata/credential-envelope-vectors.json"
+             Link="testdata/credential-envelope-vectors.json"
+             CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

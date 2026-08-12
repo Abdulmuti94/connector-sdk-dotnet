@@ -23,6 +23,8 @@ internal sealed class Dispatcher
     private readonly IReadOnlyDictionary<string, ToolDeclaration> _tools;
     private readonly Func<ConnectorMsg, Task> _send;
     private readonly ILogger? _logger;
+    private readonly VestedAI.ConnectorSdk.Credential.CredentialOpener? _credentialOpener;
+    private readonly Func<string> _connectorId;
 
     /// <param name="tools">All registered tool declarations keyed by tool key.</param>
     /// <param name="send">
@@ -33,11 +35,17 @@ internal sealed class Dispatcher
     public Dispatcher(
         IReadOnlyDictionary<string, ToolDeclaration> tools,
         Func<ConnectorMsg, Task> send,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        // Null for connectors that declare no credential schema.
+        VestedAI.ConnectorSdk.Credential.CredentialOpener? credentialOpener = null,
+        // Lazy: the hub assigns the connector id at HelloAck, after construction.
+        Func<string>? connectorId = null)
     {
         _tools = tools;
         _send = send;
         _logger = logger;
+        _credentialOpener = credentialOpener;
+        _connectorId = connectorId ?? (() => "");
     }
 
     /// <summary>
@@ -90,6 +98,20 @@ internal sealed class Dispatcher
         // 4. Invoke handler
         try
         {
+            if (decl.IsPaginated)
+            {
+                var cursor = new DatasetCursor
+                {
+                    Token    = string.IsNullOrEmpty(req.Cursor) ? null : req.Cursor,
+                    PageSize = (int)req.PageSize,
+                };
+                var handler = (ToolHandlerBase)Activator.CreateInstance(decl.HandlerType)!;
+                var page    = await handler.InvokePagedBoxedAsync(args, cursor, ctx).ConfigureAwait(false);
+                var bytes   = JsonSerializer.SerializeToUtf8Bytes(new { rows = page.Rows });
+                await ReplyPageAsync(req.InvocationId, bytes, page.NextCursor, page.Total).ConfigureAwait(false);
+                return;
+            }
+
             var result = await decl.InvokeAsync(args, ctx).ConfigureAwait(false);
             var resultBytes = JsonSerializer.SerializeToUtf8Bytes(result, result.GetType());
             await ReplyOkAsync(req.InvocationId, resultBytes).ConfigureAwait(false);
@@ -100,7 +122,7 @@ internal sealed class Dispatcher
         }
     }
 
-    private static ToolContext BuildContext(ToolCallRequest req)
+    private ToolContext BuildContext(ToolCallRequest req)
     {
         // organization_id is a string on the wire; coerce to int (0 when missing/unparseable).
         int orgId = int.TryParse(req.OrganizationId, out var n) ? n : 0;
@@ -117,6 +139,13 @@ internal sealed class Dispatcher
             EmployeeNo                = req.EmployeeNo ?? "",
             ErpIdentifier             = req.ErpIdentifier ?? "",
             ErpDepartmentIdentifiers  = req.ErpDepartmentIdentifiers.ToArray(),
+            // Lazy: most tools never read the credential, and one that doesn't
+            // ask should neither pay for a decrypt nor fail because of one.
+            Credentials = new VestedAI.ConnectorSdk.Credential.CredentialResolver(
+                _credentialOpener,
+                req.CredentialEnvelopeJson.IsEmpty ? null : req.CredentialEnvelopeJson.ToByteArray(),
+                _connectorId,
+                req.UserId ?? ""),
         };
     }
 
@@ -129,6 +158,22 @@ internal sealed class Dispatcher
                 InvocationId = invocationId,
                 ResultJson    = ByteString.CopyFrom(resultJson),
                 DurationMs    = 0,
+            }
+        };
+        return _send(msg);
+    }
+
+    private Task ReplyPageAsync(string invocationId, byte[] rowsJson, string? nextCursor, long? total)
+    {
+        var msg = new ConnectorMsg
+        {
+            ToolCallResponse = new ToolCallResponse
+            {
+                InvocationId = invocationId,
+                ResultJson   = ByteString.CopyFrom(rowsJson),
+                NextCursor   = nextCursor ?? "",
+                TotalRows    = total.HasValue ? (ulong)total.Value : 0UL,
+                DurationMs   = 0,
             }
         };
         return _send(msg);

@@ -1,6 +1,8 @@
 using Google.Protobuf;
 using Vested.V1;
+using VestedAI.ConnectorSdk.Credential;
 using VestedAI.ConnectorSdk.Errors;
+using VestedAI.ConnectorSdk.Tool;
 
 namespace VestedAI.ConnectorSdk.Runtime;
 
@@ -19,6 +21,8 @@ internal sealed class Daemon
     private readonly GrpcClient _client;
     private readonly SignalHandler _signals;
     private readonly Action<Vested.V1.ToolCallRequest>? _dispatcher;
+    private readonly VestedAI.ConnectorSdk.Credential.CredentialOpDispatcher? _credentialOps;
+    private readonly SessionIdentity? _identity;
 
     private HeartbeatTimer? _heartbeat;
 
@@ -33,12 +37,19 @@ internal sealed class Daemon
         IConnectorRuntime app,
         GrpcClient client,
         SignalHandler signals,
-        Action<Vested.V1.ToolCallRequest>? dispatcher = null)
+        Action<Vested.V1.ToolCallRequest>? dispatcher = null,
+        // Null when the connector declares no per-user credential handler.
+        VestedAI.ConnectorSdk.Credential.CredentialOpDispatcher? credentialOps = null,
+        // Filled in from HelloAck so the credential paths can verify the
+        // envelope's identity binding. Null when no credential schema is declared.
+        SessionIdentity? identity = null)
     {
         _app = app;
         _client = client;
         _signals = signals;
         _dispatcher = dispatcher;
+        _credentialOps = credentialOps;
+        _identity = identity;
     }
 
     /// <summary>Runs one connector session and returns an exit code (0, 1, or 78).</summary>
@@ -64,6 +75,12 @@ internal sealed class Daemon
                 throw new ConnectorException("expected HelloAck, got something else");
 
             var ack = ackMsg.HelloAck;
+
+            // Publish the hub-assigned id to the credential paths, which were
+            // constructed before this point and read it through a Func<string>.
+            if (_identity is not null)
+                _identity.ConnectorId = ack.ConnectorId;
+
             Console.WriteLine(
                 $"[vested] connected to hub: connector_id={ack.ConnectorId} " +
                 $"namespace={ack.Namespace} " +
@@ -153,6 +170,18 @@ internal sealed class Daemon
                     _dispatcher(msg.ToolCallRequest);
                 }
             }
+            else if (msg.CredentialOpRequest is not null)
+            {
+                // Answered inline: a credential op is one call to one system
+                // and the platform is waiting on a bounded deadline. Silence
+                // would make it wait the deadline out.
+                if (_credentialOps is not null)
+                {
+                    var credResp = await _credentialOps.DispatchAsync(msg.CredentialOpRequest);
+                    await _client.SendAsync(new ConnectorMsg { CredentialOpResponse = credResp })
+                        .ConfigureAwait(false);
+                }
+            }
             else if (msg.HeartbeatAck is not null)
             {
                 // no-op
@@ -221,24 +250,61 @@ internal sealed class Daemon
             {
                 if (!toolKey.StartsWith(nsPrefix, StringComparison.Ordinal)) continue;
 
-                a.Tools.Add(new ToolDecl
-                {
-                    Key              = toolDecl.Key,
-                    Name             = toolDecl.Name,
-                    Description      = toolDecl.Description,
-                    InputSchemaJson  = ByteString.CopyFromUtf8(toolDecl.InputSchemaJson),
-                    OutputSchemaJson = toolDecl.OutputSchemaJson is not null
-                        ? ByteString.CopyFromUtf8(toolDecl.OutputSchemaJson)
-                        : ByteString.Empty,
-                    DefaultDeadlineMs = (uint)toolDecl.DefaultDeadlineMs,
-                    MaxResultBytes    = (uint)toolDecl.MaxResultBytes,
-                    Sensitivity       = toolDecl.Sensitivity,
-                });
+                a.Tools.Add(ToProto(toolDecl));
             }
 
             reg.Agents.Add(a);
         }
 
+        // Absent when the connector declares no per-user auth — that absence is
+        // what tells the platform to hide it from the credential UI and never
+        // gate its tools.
+        if (_app.CredentialSchema is not null)
+            reg.CredentialSchema = ToProto(_app.CredentialSchema);
+
         return new ConnectorMsg { Register = reg };
     }
+
+    /// <summary>Maps a <see cref="CredentialDeclaration"/> to its proto representation.</summary>
+    internal static CredentialSchemaDecl ToProto(CredentialDeclaration d)
+    {
+        var decl = new CredentialSchemaDecl
+        {
+            Kind     = d.Kind,
+            Title    = d.Title,
+            HelpText = d.HelpText,
+        };
+
+        foreach (var f in d.Fields)
+        {
+            var field = new CredentialFieldDecl
+            {
+                Key         = f.Key,
+                Label       = f.Label,
+                Type        = f.Type,
+                Required    = f.Required,
+                Placeholder = f.Placeholder,
+            };
+            field.Options.AddRange(f.Options);
+            decl.Fields.Add(field);
+        }
+
+        return decl;
+    }
+
+    /// <summary>Maps a <see cref="ToolDeclaration"/> to its proto <see cref="ToolDecl"/> representation.</summary>
+    internal static ToolDecl ToProto(ToolDeclaration d) => new ToolDecl
+    {
+        Key               = d.Key,
+        Name              = d.Name,
+        Description       = d.Description,
+        InputSchemaJson   = ByteString.CopyFromUtf8(d.InputSchemaJson),
+        OutputSchemaJson  = d.OutputSchemaJson is not null
+            ? ByteString.CopyFromUtf8(d.OutputSchemaJson)
+            : ByteString.Empty,
+        DefaultDeadlineMs = (uint)d.DefaultDeadlineMs,
+        MaxResultBytes    = (uint)d.MaxResultBytes,
+        Sensitivity       = d.Sensitivity,
+        ResultKind        = d.IsPaginated ? Vested.V1.ResultKind.Rowset : Vested.V1.ResultKind.Single,
+    };
 }

@@ -1,6 +1,8 @@
 using System.Text.Json.Nodes;
 using NJsonSchema;
+using NJsonSchema.Generation;
 using VestedAI.ConnectorSdk.Agent;
+using VestedAI.ConnectorSdk.Credential;
 using VestedAI.ConnectorSdk.Errors;
 using VestedAI.ConnectorSdk.Tool;
 
@@ -13,6 +15,29 @@ namespace VestedAI.ConnectorSdk.Reflection;
 /// </summary>
 public static class DeclarationFactory
 {
+    /// <summary>
+    /// Schema-generation settings shared by tool input/output schema building.
+    /// </summary>
+    /// <remarks>
+    /// <c>FlattenInheritanceHierarchy</c> is essential: by default NJsonSchema
+    /// represents class inheritance as
+    /// <c>allOf: [{$ref: base}, {derived props, additionalProperties:false}]</c>
+    /// with the base definition <em>also</em> <c>additionalProperties:false</c>.
+    /// That composition is unsatisfiable — JSON Schema evaluates
+    /// <c>additionalProperties</c> per-subschema, so the derived branch rejects
+    /// every base-level property and the base branch rejects every derived
+    /// property; only <c>{}</c> validates. A connector whose args type subclasses
+    /// a shared base would then have every tool call rejected by the hub with
+    /// "additional properties ... not allowed". Flattening collapses the
+    /// hierarchy into a single object schema where inherited and derived
+    /// properties share one <c>additionalProperties:false</c>.
+    /// </remarks>
+    private static readonly SystemTextJsonSchemaGeneratorSettings SchemaSettings = new()
+    {
+        FlattenInheritanceHierarchy = true,
+    };
+
+
     /// <summary>
     /// Build an <see cref="AgentDeclaration"/> from a class decorated with
     /// <see cref="AgentAttribute"/> and zero-or-more <see cref="InstructionAttribute"/>s.
@@ -42,6 +67,122 @@ public static class DeclarationFactory
     }
 
     /// <summary>
+    /// Build a <see cref="CredentialDeclaration"/> from a class decorated with
+    /// <see cref="CredentialAttribute"/> and one
+    /// <see cref="CredentialFieldAttribute"/> per form field.
+    /// </summary>
+    /// <remarks>
+    /// Validation is strict and happens at startup rather than at registration:
+    /// a malformed credential schema would otherwise surface as a rejected
+    /// <c>Register</c> or, worse, a form the user cannot complete.
+    /// </remarks>
+    /// <exception cref="ConnectorException">
+    /// Thrown when <c>[Credential]</c> is missing, the type does not implement
+    /// <see cref="IUserCredentialHandler"/>, the kind or a field type is not
+    /// canonical, no fields are declared, a field key is blank or duplicated,
+    /// or a "select" field declares no options.
+    /// </exception>
+    public static CredentialDeclaration FromCredentialType(Type t)
+    {
+        var credAttr = t.GetCustomAttributes(typeof(CredentialAttribute), inherit: false)
+                        .Cast<CredentialAttribute>()
+                        .FirstOrDefault()
+                   ?? throw new ConnectorException(
+                          $"Type {t.FullName} is missing the [Credential] attribute.");
+
+        if (!typeof(IUserCredentialHandler).IsAssignableFrom(t))
+        {
+            throw new ConnectorException(
+                $"Type {t.FullName} is decorated with [Credential] but does not implement " +
+                "IUserCredentialHandler.");
+        }
+
+        // The parameterless-constructor requirement is enforced in Build(), and
+        // only when the SDK has to construct the handler itself — a handler with
+        // dependencies can be supplied ready-made via UseCredentialHandler.
+        if (t.IsAbstract)
+        {
+            throw new ConnectorException(
+                $"Credential handler {t.FullName} must be a concrete class.");
+        }
+
+        var kind = string.IsNullOrWhiteSpace(credAttr.Kind) ? "basic" : credAttr.Kind;
+        if (!CredentialKinds.All.Contains(kind, StringComparer.Ordinal))
+        {
+            throw new ConnectorException(
+                $"Credential handler {t.FullName} declares kind \"{kind}\"; " +
+                $"expected one of: {string.Join(", ", CredentialKinds.All)}.");
+        }
+
+        if (string.IsNullOrWhiteSpace(credAttr.Title))
+        {
+            throw new ConnectorException(
+                $"Credential handler {t.FullName} must declare a Title — it is the heading " +
+                "of the form the user fills in.");
+        }
+
+        var fieldAttrs = t.GetCustomAttributes(typeof(CredentialFieldAttribute), inherit: false)
+                          .Cast<CredentialFieldAttribute>()
+                          .ToList();
+
+        if (fieldAttrs.Count == 0)
+        {
+            throw new ConnectorException(
+                $"Credential handler {t.FullName} declares no [CredentialField]s; the platform " +
+                "would render an empty form.");
+        }
+
+        var fields = new List<CredentialFieldDeclaration>(fieldAttrs.Count);
+        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var f in fieldAttrs)
+        {
+            if (string.IsNullOrWhiteSpace(f.Key))
+            {
+                throw new ConnectorException(
+                    $"Credential handler {t.FullName} declares a [CredentialField] with no Key.");
+            }
+
+            if (!seenKeys.Add(f.Key))
+            {
+                throw new ConnectorException(
+                    $"Credential handler {t.FullName} declares duplicate field key \"{f.Key}\".");
+            }
+
+            var type = string.IsNullOrWhiteSpace(f.Type) ? "text" : f.Type;
+            if (!CredentialFieldTypes.All.Contains(type, StringComparer.Ordinal))
+            {
+                throw new ConnectorException(
+                    $"Credential field \"{f.Key}\" on {t.FullName} declares type \"{type}\"; " +
+                    $"expected one of: {string.Join(", ", CredentialFieldTypes.All)}.");
+            }
+
+            var options = f.Options ?? Array.Empty<string>();
+            if (type == "select" && options.Length == 0)
+            {
+                throw new ConnectorException(
+                    $"Credential field \"{f.Key}\" on {t.FullName} is a \"select\" but declares " +
+                    "no Options.");
+            }
+
+            fields.Add(new CredentialFieldDeclaration(
+                Key:         f.Key,
+                Label:       string.IsNullOrWhiteSpace(f.Label) ? f.Key : f.Label,
+                Type:        type,
+                Required:    f.Required,
+                Placeholder: f.Placeholder ?? "",
+                Options:     options));
+        }
+
+        return new CredentialDeclaration(
+            Kind:        kind,
+            Title:       credAttr.Title,
+            HelpText:    credAttr.HelpText ?? "",
+            Fields:      fields,
+            HandlerType: t);
+    }
+
+    /// <summary>
     /// Build a <see cref="ToolDeclaration"/> from a class decorated with
     /// <see cref="ToolAttribute"/> that also subclasses
     /// <c>ToolHandler&lt;TArgs, TResult&gt;</c>.
@@ -65,10 +206,10 @@ public static class DeclarationFactory
                    ?? throw new ConnectorException(
                           $"Type {t.FullName} is missing the [Tool] attribute.");
 
-        // Walk base-type chain to find ToolHandler<TArgs, TResult>.
-        (Type argsType, Type resultType) = ResolveHandlerGenericArgs(t)
+        // Walk base-type chain to find ToolHandler<TArgs, TResult> or PaginatedToolHandler<TArgs, TRow>.
+        (Type argsType, Type resultType, bool paginated) = ResolveHandlerGenericArgs(t)
             ?? throw new ConnectorException(
-                   $"Type {t.FullName} must subclass ToolHandler<TArgs, TResult>.");
+                   $"Type {t.FullName} must subclass ToolHandler<,> or PaginatedToolHandler<,>.");
 
         // Validate sensitivity.
         var sensitivity = toolAttr.Sensitivity ?? "";
@@ -81,8 +222,8 @@ public static class DeclarationFactory
 
         // Generate JSON schemas synchronously, then normalize the $schema
         // dialect to draft-07.
-        var inputSchemaJson  = NormalizeSchemaDialect(JsonSchema.FromType(argsType).ToJson());
-        var outputSchemaJson = NormalizeSchemaDialect(JsonSchema.FromType(resultType).ToJson());
+        var inputSchemaJson  = NormalizeSchemaDialect(JsonSchema.FromType(argsType, SchemaSettings).ToJson());
+        var outputSchemaJson = NormalizeSchemaDialect(JsonSchema.FromType(resultType, SchemaSettings).ToJson());
 
         return new ToolDeclaration
         {
@@ -97,6 +238,7 @@ public static class DeclarationFactory
             HandlerType     = t,
             ArgsType        = argsType,
             ResultType      = resultType,
+            IsPaginated     = paginated,
         };
     }
 
@@ -105,43 +247,99 @@ public static class DeclarationFactory
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// NJsonSchema emits <c>"$schema": "http://json-schema.org/draft-04/schema#"</c>.
-    /// The hub validates declared tool schemas with opis/json-schema, which
-    /// supports drafts 06/07/2019-09/2020-12 but NOT draft-04 — so a draft-04
-    /// document is rejected with a <c>schema_invalid</c> registration issue.
-    /// Rewrite the dialect to draft-07 (what the Node SDK's zod output uses,
-    /// proven compatible) so the document compiles. Keywords NJsonSchema emits
-    /// (<c>type</c>, <c>properties</c>, <c>definitions</c>, <c>$ref</c>,
-    /// <c>required</c>, <c>description</c>) are all valid under draft-07.
+    /// Normalize raw NJsonSchema output into a document the hub will accept.
+    /// Two repairs:
+    /// <list type="number">
+    /// <item><b>Dialect.</b> NJsonSchema emits
+    /// <c>"$schema": "http://json-schema.org/draft-04/schema#"</c>. The hub
+    /// validates declared schemas with opis/json-schema (drafts 06/07/2019-09/
+    /// 2020-12, NOT draft-04), so a draft-04 document is rejected with a
+    /// <c>schema_invalid</c> registration issue. Rewrite the dialect to draft-07.</item>
+    /// <item><b>"Allow any" <c>additionalProperties</c>.</b> The "any" schema of
+    /// an object-valued dictionary (<c>Dictionary&lt;string, object&gt;</c>) is
+    /// emitted by NJsonSchema as <c>"additionalProperties": {}</c> (and, on some
+    /// 11.x versions, the already-invalid <c>"additionalProperties": []</c>).
+    /// Both forms are normalized to the boolean <c>"additionalProperties": true</c>,
+    /// which is semantically identical ("allow any additional property"). This is
+    /// not cosmetic: the empty-object form <c>{}</c> is silently corrupted to the
+    /// invalid array form <c>[]</c> by any hop that round-trips the schema through
+    /// a PHP associative decode (<c>json_decode($s, true)</c> cannot distinguish
+    /// <c>{}</c> from <c>[]</c>) — e.g. the ConnectorHub's Laravel baseline store.
+    /// The result then fails draft-07 metaschema validation at tool-call time
+    /// ("output schema compile: ... additionalProperties: got array, want boolean
+    /// or object"). The boolean <c>true</c> is a scalar that survives that
+    /// round-trip intact. The SDK does not trust the floating <c>NJsonSchema 11.*</c>
+    /// dependency, nor downstream JSON handling, to preserve the empty-object form.</item>
+    /// </list>
     /// </summary>
-    private static string NormalizeSchemaDialect(string schemaJson)
+    internal static string NormalizeSchemaDialect(string schemaJson)
     {
         var node = JsonNode.Parse(schemaJson);
         if (node is JsonObject obj)
         {
             obj["$schema"] = "http://json-schema.org/draft-07/schema#";
+            RepairInvalidSchemaNodes(obj);
             return obj.ToJsonString();
         }
         return schemaJson;
     }
 
     /// <summary>
-    /// Walk the base-type chain of <paramref name="t"/> looking for a closed
-    /// generic <c>ToolHandler&lt;TArgs, TResult&gt;</c> base type and extract
-    /// the two type arguments.
+    /// Recursively normalize the "allow any" <c>additionalProperties</c> schema to
+    /// the boolean form <c>true</c>. NJsonSchema emits it as an empty object
+    /// <c>{}</c> (or, on some 11.x versions, the invalid empty array <c>[]</c>);
+    /// both mean "any additional property is allowed". The empty-object form is
+    /// fragile — it is mangled to the invalid <c>[]</c> by any PHP associative
+    /// round-trip downstream (see <see cref="NormalizeSchemaDialect"/>) — so we
+    /// rewrite both the array and empty-object forms to the scalar <c>true</c>,
+    /// which survives such round-trips and is valid against the metaschema. A
+    /// non-empty <c>additionalProperties</c> schema, and the boolean <c>false</c>
+    /// (meaning "no additional properties"), are left untouched.
     /// </summary>
-    private static (Type argsType, Type resultType)? ResolveHandlerGenericArgs(Type t)
+    private static void RepairInvalidSchemaNodes(JsonNode? node)
     {
-        var handlerOpen = typeof(ToolHandler<,>);
-        var current = t.BaseType;
-        while (current is not null)
+        switch (node)
         {
-            if (current.IsGenericType && current.GetGenericTypeDefinition() == handlerOpen)
+            case JsonObject obj:
+                if (obj.TryGetPropertyValue("additionalProperties", out var ap)
+                    && (ap is JsonArray || (ap is JsonObject apObj && apObj.Count == 0)))
+                {
+                    obj["additionalProperties"] = JsonValue.Create(true);
+                }
+                // Snapshot values before recursing — nested repairs mutate child
+                // objects, not the collection being enumerated here.
+                foreach (var child in obj.Select(kv => kv.Value).ToList())
+                {
+                    RepairInvalidSchemaNodes(child);
+                }
+                break;
+            case JsonArray arr:
+                foreach (var item in arr.ToList())
+                {
+                    RepairInvalidSchemaNodes(item);
+                }
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Walk the base-type chain of <paramref name="t"/> looking for a closed
+    /// generic <c>ToolHandler&lt;TArgs, TResult&gt;</c> or
+    /// <c>PaginatedToolHandler&lt;TArgs, TRow&gt;</c> base type and extract
+    /// the two type arguments together with a flag indicating which it found.
+    /// </summary>
+    private static (Type argsType, Type resultType, bool paginated)? ResolveHandlerGenericArgs(Type t)
+    {
+        var single = typeof(ToolHandler<,>);
+        var paged  = typeof(PaginatedToolHandler<,>);
+        for (var cur = t.BaseType; cur is not null; cur = cur.BaseType)
+        {
+            if (cur.IsGenericType)
             {
-                var args = current.GetGenericArguments();
-                return (args[0], args[1]);
+                var def = cur.GetGenericTypeDefinition();
+                if (def == single) { var a = cur.GetGenericArguments(); return (a[0], a[1], false); }
+                if (def == paged)  { var a = cur.GetGenericArguments(); return (a[0], a[1], true); }
             }
-            current = current.BaseType;
         }
         return null;
     }
