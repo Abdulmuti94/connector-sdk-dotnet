@@ -136,10 +136,16 @@ masked; `select` needs `options`. The platform builds the user's form from this
 public sealed class WarehouseCredentials : IUserCredentialHandler { /* … */ }
 ```
 
-`Key` is the map key your handler and tools read — `credential["username"]`.
+`Key` is the map key your handler and tools read — `credential["username"]`. It
+must match `^[a-z][a-z0-9_]*$`: lower-case, starting with a letter, words joined
+by underscores. `web_service_access_key`, not `webServiceAccessKey`. The platform
+enforces this too, and it refuses the entire registration over one bad key — so
+the SDK checks it up front rather than letting it surface as a rejected
+`Register` on a connector you have already deployed.
+
 `Required` defaults to true. The declaration is validated when the builder runs,
-so a `select` with no `Options`, a duplicate key, or an unknown type fails at
-startup rather than producing a form the user cannot complete.
+so a malformed key, a `select` with no `Options`, a duplicate key, or an unknown
+type fails at startup rather than producing a form the user cannot complete.
 
 ## Key rotation
 

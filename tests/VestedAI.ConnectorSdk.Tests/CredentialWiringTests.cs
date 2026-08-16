@@ -75,6 +75,21 @@ public sealed class SelectWithoutOptionsHandler : UndeclaredHandlerBase { }
 [CredentialField(Key = "token")]
 public sealed class DuplicateKeyHandler : UndeclaredHandlerBase { }
 
+// The hub requires ^[a-z][a-z0-9_]*$ of every field key and rejects the whole
+// Register when one does not match. These cover the ways a hand-written key
+// misses it: capitals, a leading digit, and a separator that is not "_".
+[Credential(Title = "camelCase field key")]
+[CredentialField(Key = "webServiceAccessKey", Type = "password")]
+public sealed class CamelCaseKeyHandler : UndeclaredHandlerBase { }
+
+[Credential(Title = "Field key starting with a digit")]
+[CredentialField(Key = "2fa_code")]
+public sealed class LeadingDigitKeyHandler : UndeclaredHandlerBase { }
+
+[Credential(Title = "Field key with a dash")]
+[CredentialField(Key = "access-key")]
+public sealed class DashedKeyHandler : UndeclaredHandlerBase { }
+
 [Credential(Title = "No fields")]
 public sealed class NoFieldsHandler : UndeclaredHandlerBase { }
 
@@ -146,8 +161,36 @@ public class CredentialDeclarationTests
     [InlineData(typeof(DuplicateKeyHandler))]
     [InlineData(typeof(NoFieldsHandler))]
     [InlineData(typeof(NoTitleHandler))]
+    [InlineData(typeof(CamelCaseKeyHandler))]
+    [InlineData(typeof(LeadingDigitKeyHandler))]
+    [InlineData(typeof(DashedKeyHandler))]
     public void FromCredentialType_RejectsMalformedDeclarations(Type t)
         => Assert.Throws<ConnectorException>(() => DeclarationFactory.FromCredentialType(t));
+
+    // The point of validating the key shape here is that the developer learns
+    // the fix at build time. A message that only restated the rule would still
+    // leave them guessing, so it names the key it would accept.
+    [Fact]
+    public void FromCredentialType_SuggestsTheSnakeCaseKey()
+    {
+        var ex = Assert.Throws<ConnectorException>(
+            () => DeclarationFactory.FromCredentialType(typeof(CamelCaseKeyHandler)));
+
+        Assert.Contains("webServiceAccessKey", ex.Message);
+        Assert.Contains("web_service_access_key", ex.Message);
+    }
+
+    // A key that cannot be rescued by lower-casing gets the rule without a
+    // bogus suggestion — "2fa_code" snake-cases to itself, still invalid.
+    [Fact]
+    public void FromCredentialType_OmitsASuggestionItCannotMake()
+    {
+        var ex = Assert.Throws<ConnectorException>(
+            () => DeclarationFactory.FromCredentialType(typeof(LeadingDigitKeyHandler)));
+
+        Assert.Contains("^[a-z][a-z0-9_]*$", ex.Message);
+        Assert.DoesNotContain("e.g.", ex.Message);
+    }
 
     [Fact]
     public void ScanAssembly_FindsTheDeclaredHandler()

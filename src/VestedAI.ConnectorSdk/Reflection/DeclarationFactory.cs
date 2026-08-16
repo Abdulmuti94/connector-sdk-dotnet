@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using NJsonSchema;
 using NJsonSchema.Generation;
 using VestedAI.ConnectorSdk.Agent;
@@ -36,6 +37,44 @@ public static class DeclarationFactory
     {
         FlattenInheritanceHierarchy = true,
     };
+
+    /// <summary>
+    /// Shape the hub requires of a credential field key. Mirrored from the
+    /// platform's own check, which rejects the whole <c>Register</c> when a key
+    /// does not match — so a key that only fails there costs a deploy to find.
+    /// </summary>
+    private static readonly Regex CredentialFieldKey =
+        new(@"^[a-z][a-z0-9_]*$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Best-effort snake_case rendering of a rejected field key, used only to
+    /// suggest a fix in the error message. The caller re-checks the result and
+    /// drops the suggestion when it is not itself valid, so this never has to
+    /// handle every input — a wrong hint would be worse than none.
+    /// </summary>
+    private static string SnakeCase(string key)
+    {
+        var sb = new System.Text.StringBuilder(key.Length + 8);
+
+        foreach (var c in key)
+        {
+            if (char.IsUpper(c))
+            {
+                if (sb.Length > 0 && sb[^1] != '_') sb.Append('_');
+                sb.Append(char.ToLowerInvariant(c));
+            }
+            else if (char.IsLetterOrDigit(c))
+            {
+                sb.Append(c);
+            }
+            else if (sb.Length > 0 && sb[^1] != '_')
+            {
+                sb.Append('_');
+            }
+        }
+
+        return sb.ToString().Trim('_');
+    }
 
 
     /// <summary>
@@ -141,6 +180,19 @@ public static class DeclarationFactory
             {
                 throw new ConnectorException(
                     $"Credential handler {t.FullName} declares a [CredentialField] with no Key.");
+            }
+
+            if (!CredentialFieldKey.IsMatch(f.Key))
+            {
+                var suggestion = SnakeCase(f.Key);
+                throw new ConnectorException(
+                    $"Credential field key \"{f.Key}\" on {t.FullName} must match " +
+                    "^[a-z][a-z0-9_]*$ — lower-case, starting with a letter, words joined by " +
+                    "underscores" +
+                    (CredentialFieldKey.IsMatch(suggestion) ? $" (e.g. \"{suggestion}\")" : "") +
+                    ". The platform enforces this at registration and refuses the whole " +
+                    "connector, so a key that is only wrong in case would otherwise surface " +
+                    "as a rejected Register on a deployed connector.");
             }
 
             if (!seenKeys.Add(f.Key))
