@@ -27,11 +27,22 @@ namespace BcConnector;
 // and offers no DI container, so this client is a process-wide singleton built
 // from the environment once at startup (see Program.cs -> BcClient.Configure()).
 // A single static HttpClient is reused for the lifetime of the process.
+//
+// AUTHENTICATION IS PER CALLER. The shared HttpClient carries NO default
+// Authorization header: every request sets its own from the credential on the
+// invocation's ToolContext (see BcCredentials). Sharing the client is still
+// correct and desirable — it preserves connection pooling — because
+// NavUserPassword is HTTP Basic, a stateless per-request header with no
+// connection affinity. That assumption is load-bearing: if this environment is
+// ever switched to NTLM or Negotiate, authentication binds to the *connection*,
+// and a pooled connection would carry one user's identity into another user's
+// request. Such a switch requires per-user HttpClients (or SocketsHttpHandler
+// pool partitioning), not just a different header.
 // ---------------------------------------------------------------------------
 
 /// <summary>
-/// Thin client for the ASG AI Gateway over ODataV4, authenticated with
-/// NavUserPassword basic auth. Each call may target a specific BC company
+/// Thin client for the ASG AI Gateway over ODataV4, authenticated per caller
+/// with NavUserPassword basic auth. Each call may target a specific BC company
 /// (tools expose an optional <c>country</c> arg); when none is given the
 /// default from <see cref="BcCompanyRegistry"/> / BC_COMPANY is used.
 /// The gateway-record id is taken from BC_COMPANY_MAP when configured,
@@ -60,17 +71,22 @@ internal static class BcClient
 
     internal static JsonSerializerOptions JsonOptions => JsonOpts;
 
+    /// <summary>True once <see cref="Configure"/> has run and the endpoint is known.</summary>
+    public static bool IsConfigured => _http is not null;
+
     /// <summary>
     /// Read and validate BC_* environment variables and build the shared HttpClient.
     /// Call once at startup. Throws <see cref="ConnectorException"/> when a required
     /// variable is missing so the process fails fast before connecting to the hub.
+    ///
+    /// No credentials are read here. Every request authenticates as its own caller
+    /// from the sealed per-user credential on the ToolContext; there is no shared
+    /// service account to configure.
     /// </summary>
     public static void Configure()
     {
-        var baseUrl  = Require("BC_BASE_URL");   // e.g. https://bc-host:8048/BC/ODataV4
-        var company  = Require("BC_COMPANY");    // default company, e.g. ASG
-        var username = Require("BC_USERNAME");
-        var password = Require("BC_PASSWORD");
+        var baseUrl = Require("BC_BASE_URL");   // e.g. https://bc-host:8048/BC/ODataV4
+        var company = Require("BC_COMPANY");    // default company, e.g. ASG
 
         _apiBase = baseUrl.TrimEnd('/');
         _defaultCompany = company;
@@ -79,33 +95,93 @@ internal static class BcClient
             company,
             Environment.GetEnvironmentVariable("BC_COMPANY_MAP"));
 
+        // Must be >= the largest DefaultDeadlineMs any tool declares, or that tool's
+        // deadline is fiction: this timeout aborts the call first and the hub reports a
+        // connector error at ~30s. net_inventory / available_inventory declare 120s
+        // (a single-branch, all-items aggregate runs 15-30s), so the floor is 120.
+        // Tools with a shorter deadline are still bounded by the hub, not by this.
         var timeoutSeconds = int.TryParse(
-            Environment.GetEnvironmentVariable("BC_TIMEOUT_SECONDS"), out var t) ? t : 30;
+            Environment.GetEnvironmentVariable("BC_TIMEOUT_SECONDS"), out var t) ? t : 120;
 
         var http = new HttpClient
         {
             Timeout = TimeSpan.FromSeconds(timeoutSeconds),
         };
 
-        var credentials = Convert.ToBase64String(
-            Encoding.UTF8.GetBytes($"{username}:{password}"));
-        http.DefaultRequestHeaders.Authorization =
-            new AuthenticationHeaderValue("Basic", credentials);
+        // Deliberately no DefaultRequestHeaders.Authorization — see the header
+        // comment. Authorization is set per request, from the calling user.
         http.DefaultRequestHeaders.Accept.Add(
             new MediaTypeWithQualityHeaderValue("application/json"));
 
         _http = http;
 
-        var accessible = ProbeAccessibleCompanies(http);
-        if (accessible.Count > 0)
+        // The company routing table is NOT narrowed at startup any more. It used
+        // to be filtered to whatever the one service account could reach, which
+        // under per-user auth would apply one user's access to everyone. Company
+        // access now differs per caller and BC is the authority: an unreachable
+        // company comes back as its own "Access is denied to company" error,
+        // which SendAsync surfaces verbatim.
+        Console.WriteLine(
+            $"[bc] Per-user credentials required. Endpoint {_apiBase}, " +
+            $"default company '{_defaultCompany}', countries: {BcCompanyRegistry.SupportedCountries}.");
+    }
+
+    /// <summary>
+    /// List the BC companies a given sign-in can reach. Used by
+    /// <see cref="BcUserCredentialHandler"/> to validate a credential before the
+    /// platform stores it — this is the "does this actually work?" check that
+    /// only Business Central can answer.
+    /// </summary>
+    /// <returns>
+    /// The HTTP status, the company names (empty unless the status is 200), and
+    /// a transport-error description when the request could not be completed
+    /// at all (in which case the status is meaningless).
+    /// </returns>
+    public static async Task<(HttpStatusCode Status, IReadOnlyList<string> Companies, string? TransportError)>
+        ProbeCompaniesAsync(AuthenticationHeaderValue auth)
+    {
+        var http = _http;
+        if (http is null)
+            return (HttpStatusCode.ServiceUnavailable, Array.Empty<string>(), "connector not configured");
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{_apiBase}/Company");
+        request.Headers.Authorization = auth;
+
+        HttpResponseMessage response;
+        try
         {
-            var removed = BcCompanyRegistry.RestrictToAccessibleCompanies(accessible);
-            if (removed.Count > 0)
+            response = await http.SendAsync(request);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return (HttpStatusCode.ServiceUnavailable, Array.Empty<string>(), ex.Message);
+        }
+
+        using (response)
+        {
+            if (!response.IsSuccessStatusCode)
+                return (response.StatusCode, Array.Empty<string>(), null);
+
+            var names = new List<string>();
+            try
             {
-                Console.WriteLine(
-                    $"[bc] User '{username}' cannot access: {string.Join(", ", removed)}. " +
-                    $"Active countries: {BcCompanyRegistry.SupportedCountries}.");
+                var text = await response.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(text);
+                if (doc.RootElement.TryGetProperty("value", out var arr) &&
+                    arr.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var item in arr.EnumerateArray())
+                        if (item.TryGetProperty("Name", out var nameEl) &&
+                            nameEl.GetString() is { Length: > 0 } name)
+                            names.Add(name);
+                }
             }
+            catch (JsonException ex)
+            {
+                return (response.StatusCode, Array.Empty<string>(), $"unreadable response: {ex.Message}");
+            }
+
+            return (response.StatusCode, names, null);
         }
     }
 
@@ -142,8 +218,12 @@ internal static class BcClient
     {
         var http = Ready(toolKey);
 
+        // Resolved once per call, up front: a missing credential must fail before
+        // any work is done, and every request below carries this same caller.
+        var credential = BcCredentials.For(ctx, toolKey);
+
         var (company, payloadJson) = await BuildPayloadAsync(args, toolKey, ctx, resolveStores: true, operation);
-        var gatewayId = await ResolveGatewayIdAsync(company, toolKey);
+        var gatewayId = await ResolveGatewayIdAsync(company, toolKey, credential);
 
         // callerContext carries the authenticated caller identity (from ToolContext,
         // not from args) in its own action field, kept separate from the payload so
@@ -155,7 +235,7 @@ internal static class BcClient
         var body = JsonSerializer.Serialize(new { operation, payload = payloadJson, callerContext });
         var url = $"{_apiBase}/{CompanySegment(company)}/{GatewayEntity}({gatewayId:D})/{GatewayAction}";
 
-        using var response = await SendAsync(http, HttpMethod.Post, url, body, toolKey);
+        using var response = await SendAsync(http, HttpMethod.Post, url, body, toolKey, credential);
         var outer = await ReadJsonAsync(response, toolKey);
 
         // The bound action returns the envelope as a JSON string in OData's "value".
@@ -189,14 +269,15 @@ internal static class BcClient
         ToolContext ctx)
     {
         var http = Ready(toolKey);
+        var credential = BcCredentials.For(ctx, toolKey);
         var (_, payloadJson) = await BuildPayloadAsync(
             args, toolKey, ctx, resolveStores: false, operation, companyOverride: company);
-        var gatewayId = await ResolveGatewayIdAsync(company, toolKey);
+        var gatewayId = await ResolveGatewayIdAsync(company, toolKey, credential);
         var callerContext = BcCallerContext.Serialize(ctx);
         var body = JsonSerializer.Serialize(new { operation, payload = payloadJson, callerContext });
         var url = $"{_apiBase}/{CompanySegment(company)}/{GatewayEntity}({gatewayId:D})/{GatewayAction}";
 
-        using var response = await SendAsync(http, HttpMethod.Post, url, body, toolKey);
+        using var response = await SendAsync(http, HttpMethod.Post, url, body, toolKey, credential);
         var outer = await ReadJsonAsync(response, toolKey);
 
         if (!outer.TryGetProperty("value", out var valueEl) ||
@@ -332,7 +413,12 @@ internal static class BcClient
             node.Remove(key);
     }
 
-    private static async Task<Guid> ResolveGatewayIdAsync(string company, string toolKey)
+    // The gateway record id is a per-company singleton seeded by the AL app's
+    // install/upgrade codeunit — identical for every user and not user data — so
+    // the cache is shared across callers. Only the lookup that fills it runs as
+    // the caller, which is why the credential is a parameter here.
+    private static async Task<Guid> ResolveGatewayIdAsync(
+        string company, string toolKey, BcCredential credential)
     {
         if (_gatewayIds.TryGetValue(company, out var cached))
             return cached;
@@ -360,7 +446,7 @@ internal static class BcClient
             var http = Ready(toolKey);
             var url = $"{_apiBase}/{CompanySegment(company)}/{GatewayEntity}?$top=1";
 
-            using var response = await SendAsync(http, HttpMethod.Get, url, body: null, toolKey);
+            using var response = await SendAsync(http, HttpMethod.Get, url, body: null, toolKey, credential);
             var json = await ReadJsonAsync(response, toolKey);
 
             if (TryFirstId(json, out var id))
@@ -386,41 +472,6 @@ internal static class BcClient
     private static string CompanySegment(string company) =>
         $"Company('{Uri.EscapeDataString(company.Replace("'", "''"))}')";
 
-    private static HashSet<string> ProbeAccessibleCompanies(HttpClient http)
-    {
-        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var url = $"{_apiBase}/Company";
-
-        try
-        {
-            using var response = http.GetAsync(url).GetAwaiter().GetResult();
-            if (!response.IsSuccessStatusCode)
-                return names;
-
-            var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            using var doc = JsonDocument.Parse(text);
-            if (!doc.RootElement.TryGetProperty("value", out var arr) ||
-                arr.ValueKind != JsonValueKind.Array)
-                return names;
-
-            foreach (var item in arr.EnumerateArray())
-            {
-                if (item.TryGetProperty("Name", out var nameEl))
-                {
-                    var name = nameEl.GetString();
-                    if (!string.IsNullOrWhiteSpace(name))
-                        names.Add(name);
-                }
-            }
-        }
-        catch
-        {
-            // Keep the configured map when the probe cannot run.
-        }
-
-        return names;
-    }
-
     // Read value[0].id from an OData collection response as a Guid.
     private static bool TryFirstId(JsonElement json, out Guid id)
     {
@@ -441,9 +492,15 @@ internal static class BcClient
         HttpMethod method,
         string url,
         string? body,
-        string toolKey)
+        string toolKey,
+        BcCredential credential)
     {
         using var request = new HttpRequestMessage(method, url);
+
+        // Per request, never on the shared client: this is what keeps concurrent
+        // callers isolated on one pooled HttpClient.
+        request.Headers.Authorization = credential.Header;
+
         if (body is not null)
             request.Content = new StringContent(body, Encoding.UTF8, "application/json");
 
@@ -471,7 +528,13 @@ internal static class BcClient
         var bcMessage = TryExtractBcErrorMessage(detail);
         var reason = statusCode switch
         {
-            HttpStatusCode.Unauthorized => "authentication failed — check BC_USERNAME / BC_PASSWORD",
+            HttpStatusCode.Unauthorized => "Business Central rejected your sign-in — your stored " +
+                                           "Business Central user name or Web Service Access Key is " +
+                                           "wrong or has been regenerated. Update it in your " +
+                                           "integration settings",
+            HttpStatusCode.Forbidden    => "Business Central refused this operation for your user — " +
+                                           "your BC permissions do not allow it. Ask your BC " +
+                                           "administrator if you need access",
             HttpStatusCode.NotFound     => "endpoint not found — check BC_BASE_URL (.../ODataV4) and that OData Services are enabled on the BC instance",
             HttpStatusCode.ServiceUnavailable => "service unavailable — the BC ODataV4 endpoint is not responding (OData Services may be disabled or the instance is restarting)",
             HttpStatusCode.BadRequest when bcMessage.Contains("Access is denied to company", StringComparison.OrdinalIgnoreCase)
