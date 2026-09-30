@@ -330,9 +330,22 @@ public class SalesOpsAgent { }
         - available_inventory answers "what can we actually commit". It is net_inventory MINUS the
           unshipped quantity on transfer orders leaving that location, and it is the same figure the
           "Available Item By Location" report shows the branches, so your answer matches theirs.
-        - Use available_inventory whenever the stock is about to be promised, sent, sold or reserved:
-          "can we send X to branch Y", "do we have any to spare", "is there enough for this order".
-          Use net_inventory for stock-taking questions: what is physically here, what the components are.
+        - THE DECISION RULE, ask it before every stock answer: is something about to be PROMISED,
+          SENT, SOLD or RESERVED on the strength of this number? Then available_inventory. Is the
+          question about what we HOLD — a count, a report, a valuation, a branch or category rollup,
+          a historical figure, an export? Then net_inventory, which is cheaper and is the right
+          figure there.
+          Availability questions in practice: confirming a sales or customer order can be fulfilled,
+          a branch asking for a transfer, "can we send N of X to Y", "do we have enough for this
+          order", "can we spare any", what is safe to publish as sellable, any reservation or
+          allocation decision. If the user will act on the number by moving or committing goods, it
+          is an availability question even when they said "كم عندنا".
+        - NEVER derive availability yourself by subtracting transfer quantities from a net_inventory
+          row. The commitment set is resolved inside available_inventory, per LOCATION, exactly as
+          the "Available Item By Location - ASG" report does it — your arithmetic will not match what
+          the branch sees on their own screen, and the difference will be discovered mid-transfer.
+        - available_inventory is ALWAYS live and never served from the snapshot. Do not ask for it
+          with source 'snapshot', and never pair a snapshot net figure with a live commitment.
         - It returns everything net_inventory does plus toReservedQuantity (already promised out),
           availableInventory (the number to quote), and toIncomingQuantity (on the way IN — context
           only, NOT part of availableInventory, because it has not arrived).
@@ -370,14 +383,18 @@ public class SalesOpsAgent { }
         item list) are a live call and are fine. It is per-branch rows over EVERY item that only the
         snapshot can serve.
 
-        MANY NAMED ITEMS — bulk_stock. When the question is the exact figure for a large set of items
-        (a category-wide list, a supplier's range, "these 25,000 items", a replenishment or allocation
-        export), that is bulk_stock, not net_inventory and not the snapshot: the snapshot is store and
-        category grain so it cannot speak about a named item, and net_inventory's item list runs out of
-        filter room in the dozens. Scope it with itemNos (any size), itemCategoryCode or
-        descriptionContains; leave the stores off to cover every branch. groupBy 'item' (default) is one
-        row per item summed across the branches — ask for 'detail' only when the per-branch split IS
-        the answer, because that is items x branches rows.
+        LARGE EXPORTS — bulk_stock. It is the export path, not a second way to ask for stock: use it
+        when the result is too big for one net_inventory call, or when the run needs minutes. Scope it
+        by items (itemFilters ["E-Commerce Item=Yes"], itemCategoryCode, descriptionContains, or
+        itemNos when the numbers were handed to you), by a BRANCH (storeNo / locationCode) for a
+        whole-store export, or by both. groupBy 'item' (default) is one row per item summed across the
+        branches in scope — that is what "حصر مخزون" asks for. 'detail' is items x branches and is
+        refused when that cannot be delivered.
+        Before reaching for it, check the cheaper shapes: a few items or branches is net_inventory;
+        branch or category totals are net_inventory groupBy store/category, instant from the snapshot;
+        and EVERY item at ONE branch is net_inventory with storeNo + groupBy 'detail' in a single call
+        — which is also how to answer "these 20,000 items at store X": fetch that store once, then
+        match the list against the rows you got back.
         - NAME the set, never list it. "Every item flagged for e-commerce", "everything from this
           vendor", "all unblocked items" are itemFilters entries — ["E-Commerce Item=Yes"] — resolved
           server-side against the item card, with field names as describe_entity shows them. Do NOT run

@@ -137,50 +137,54 @@ internal static class BcToolDescriptions
         "split into batches of 50, one approval each.";
 
     public const string AvailableInventory =
-        "Available-to-send stock: net inventory MINUS what is already committed to outbound " +
-        "transfer orders from that location. Use this whenever the question is whether stock can " +
-        "actually be given away \u2014 promising an order, sending a transfer, answering \"can we spare " +
-        "any\" \u2014 because net_inventory still counts units that are physically on the shelf but already " +
-        "promised to another branch. Same arguments, filters and groupings as net_inventory, and it " +
-        "returns everything net_inventory does plus toReservedQuantity (the committed outbound " +
-        "quantity, subtracted), availableInventory (the number to quote), and toIncomingQuantity " +
-        "(on its way IN \u2014 reported for context, NEVER subtracted). This reproduces the " +
-        "\"Available Item By Location - ASG\" report, so the figure matches what the branches see. " +
-        "Reach for plain net_inventory only when the question is about stock on hand rather than " +
-        "stock that can be committed. The grouping and cost rules are net_inventory's: groupBy " +
-        "'total' is ONE row for the whole scope (never a row per store — that is groupBy " +
-        "'store'), and a call costs roughly (stores in scope) x (items in scope), so an all-items " +
-        "rollup over many branches will time out. Narrow the item scope rather than calling once " +
-        "per branch. Unlike net_inventory this is ALWAYS computed live and is never served from the " +
-        "inventory snapshot: it subtracts transfer commitments that change by the minute, and a " +
-        "stale net minus a live commitment is a number that means nothing.";
+        "AVAILABLE-TO-COMMIT stock: net inventory MINUS the quantity already committed to outbound " +
+        "transfer orders and not yet shipped. THE DECISION RULE: is something about to be PROMISED, " +
+        "SENT, SOLD or RESERVED on the strength of this number? Then it is this tool. Is the " +
+        "question about what we hold \u2014 a count, a report, a valuation, a branch rollup? Then it is " +
+        "net_inventory. Use available_inventory for: confirming a sales or customer order can be " +
+        "fulfilled, answering a branch asking for a transfer, 'can we send N of X to Y', 'do we " +
+        "have enough for this order', 'can we spare any', deciding what to publish as sellable, and " +
+        "any reservation or allocation decision. Do NOT use it for stock-taking, '\u0643\u0645 \u0639\u0646\u062f\u0646\u0627', " +
+        "inventory valuation, branch or category totals, historical questions, or exports \u2014 " +
+        "net_inventory is cheaper and is the right figure there. NEVER derive availability yourself " +
+        "by subtracting transfer quantities from a net_inventory row: the commitment set is resolved " +
+        "here, per location, exactly as report 'Available Item By Location - ASG' does it, so your " +
+        "figure matches what the branches see and a hand-rolled one will not. It returns everything " +
+        "net_inventory does plus toReservedQuantity (the committed outbound quantity, subtracted), " +
+        "availableInventory (THE number to quote), and toIncomingQuantity (on its way IN \u2014 context " +
+        "only, NEVER added to what you can promise, because it has not arrived). availableInventory " +
+        "can be NEGATIVE when more is promised than is on hand: say so plainly, never round it up to " +
+        "zero. ALWAYS computed live and never served from the inventory snapshot \u2014 commitments " +
+        "change by the minute, and a stale net minus a live commitment is a number that means " +
+        "nothing. Same arguments, groupings and shape rules as net_inventory: groupBy 'total' is ONE " +
+        "row for the whole scope (a row per branch is groupBy 'store'), cost is roughly (branches in " +
+        "scope) x (items in scope), and a scope too large to answer is refused up front \u2014 narrow " +
+        "the items or take one branch at a time, never loop per item or per branch.";
 
     public const string BulkStock =
-        "EXACT live stock for a LARGE set of items \u2014 thousands of them \u2014 in one run, optionally " +
-        "broken down per branch. This is the tool for \"the stock of these 25,000 items\", a category-wide " +
-        "or catalogue-wide item list, a replenishment or allocation export. Scope it by NAMING the set, " +
-        "never by listing it: itemFilters ([\"E-Commerce Item=Yes\"] \u2014 any field on the item card, " +
-        "ANDed), itemCategoryCode, descriptionContains, or itemNos when the caller genuinely handed you " +
-        "the numbers. NEVER assemble an item list yourself (run_sql, code_interpreter, a file) to feed " +
-        "itemNos: thousands of item numbers do not fit in a tool argument, and itemFilters resolves the " +
-        "same set server-side in one call. Optionally scope storeNos / locationCode; " +
-        "omitting the store scope covers every branch and costs nothing extra. groupBy 'item' (the " +
-        "default) returns ONE row per item, its stock summed over every store in scope; groupBy 'detail' " +
-        "returns one row per item PER STORE, which over a large scope can be a million rows \u2014 ask for it " +
-        "only when the per-branch split is the answer \u2014 it writes one row per item per branch, so a " +
-        "catalogue-sized scope is rejected up front rather than run for twenty minutes. \"\u062d\u0635\u0631 \u0645\u062e\u0632\u0648\u0646\" / " +
-        "\"how much of each item do we hold\" is groupBy 'item'. Returns a dataset: a sample plus a dataset_ref, so " +
-        "the full set is exported or computed over rather than read into the conversation. The figures " +
-        "are computed from the ledger at run time (never from the snapshot) and every row says " +
-        "source='live'. It takes MINUTES for a large scope, and the work is done server-side in one pass " +
-        "per chunk \u2014 never call it once per item, and never fall back to net_inventory in a loop. If a " +
-        "call reports the run is still computing, call again with the runId it gives you and the same " +
-        "scope: the run resumes where it stopped and nothing is recomputed. Choosing between the three " +
-        "stock tools: a few items or a few branches \u2192 net_inventory; what a BRANCH holds in total, or " +
-        "per category \u2192 net_inventory groupBy store/category (instant, from the snapshot); what these " +
-        "MANY NAMED ITEMS hold \u2192 this tool. For anything about to be promised, sent or sold, use " +
-        "available_inventory instead \u2014 bulk_stock is net inventory and does not subtract outbound " +
-        "transfer commitments.";
+        "LARGE STOCK EXPORT: exact live net inventory for a scope too big for one net_inventory " +
+        "call, computed server-side across as many calls as it needs and returned as a dataset. " +
+        "SCOPE IT by items (itemFilters [\"E-Commerce Item=Yes\"] \u2014 any field on the item card, " +
+        "ANDed; itemCategoryCode; descriptionContains; or itemNos when the caller handed you the " +
+        "numbers), by a BRANCH (storeNo / storeNos / locationCode) for a whole-store export, or by " +
+        "both. NEVER assemble an item list yourself (run_sql, code_interpreter, a file) to feed " +
+        "itemNos \u2014 thousands of item numbers do not fit in a tool argument, and itemFilters " +
+        "resolves the same set server-side. groupBy 'item' (the default) is ONE row per item, its " +
+        "stock summed over the branches in scope \u2014 that is the answer to '\u062d\u0635\u0631 \u0645\u062e\u0632\u0648\u0646' / 'how much of " +
+        "each item do we hold'. groupBy 'detail' is one row per item PER BRANCH; over a large scope " +
+        "that is items x branches rows and is refused up front rather than run for twenty minutes. " +
+        "WHICH TOOL: a few items or a few branches \u2192 net_inventory; what a BRANCH holds in total " +
+        "or per category \u2192 net_inventory groupBy store/category (instant, from the snapshot); EVERY " +
+        "item at ONE branch \u2192 net_inventory with storeNo + groupBy 'detail' (one call \u2014 cheaper " +
+        "than an export, and the way to answer 'these 20,000 items at store X': fetch the store, " +
+        "then match the list against the rows); thousands of named items across branches, or an " +
+        "export that needs minutes \u2192 THIS tool. Figures are computed from the ledger at run time " +
+        "(never the snapshot) and every row says source='live'. If a call reports the run is still " +
+        "computing, call again with the runId it gives you and the same scope: it resumes where it " +
+        "stopped and nothing is recomputed \u2014 that is not a failure and not a reason to start over " +
+        "or to split the scope. For anything about to be promised, sent or sold use " +
+        "available_inventory: this is net inventory and does not subtract outbound transfer " +
+        "commitments.";
 
     public const string ItemType =
         "Item type: Inventory, Service, or Non-Inventory. ONLY Inventory items carry real stock \u2014 " +

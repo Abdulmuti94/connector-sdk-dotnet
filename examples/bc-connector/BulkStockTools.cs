@@ -198,21 +198,28 @@ public class GetBulkStock : PaginatedToolHandler<GetBulkStock.Args, GetBulkStock
     {
         const string ToolKey = "erp_bc.inventory.bulk_stock";
 
+        // A STORE scope counts: "every item at store X" is a whole-branch export, and it
+        // is how a large item list should be answered — retrieve the store once, match the
+        // list locally. What is refused is an UNSCOPED run, which is the catalogue-wide
+        // matrix no dataset can carry.
         var hasScope =
             !string.IsNullOrWhiteSpace(args.ItemNo) ||
             args.ItemNos.Any(n => !string.IsNullOrWhiteSpace(n)) ||
             args.ItemFilters.Any(f => !string.IsNullOrWhiteSpace(f)) ||
             !string.IsNullOrWhiteSpace(args.ItemCategoryCode) ||
-            !string.IsNullOrWhiteSpace(args.DescriptionContains);
+            !string.IsNullOrWhiteSpace(args.DescriptionContains) ||
+            !string.IsNullOrWhiteSpace(args.StoreNo) ||
+            args.StoreNos.Any(n => !string.IsNullOrWhiteSpace(n)) ||
+            !string.IsNullOrWhiteSpace(args.StoreNameContains) ||
+            !string.IsNullOrWhiteSpace(args.LocationCode);
 
-        // The whole point of this tool is an ITEM scope. Without one the question is a
-        // branch rollup, which net_inventory answers from the snapshot in milliseconds —
-        // sending it here would compute the entire catalogue the slow way instead.
         if (!hasScope)
             throw new ToolValidationException(
                 ToolKey,
-                "bulk_stock needs an item scope: itemFilters, itemNos, itemCategoryCode or descriptionContains. " +
-                "For per-branch totals over the whole catalogue use net_inventory with groupBy 'store'.");
+                "A stock export needs a scope: items (itemFilters, itemNos, itemCategoryCode, " +
+                "descriptionContains), a branch (storeNo, storeNos, locationCode), or both. Every item " +
+                "at every store is the full matrix and cannot be delivered as one dataset. For branch " +
+                "totals use net_inventory with groupBy 'store' — that is instant, from the snapshot.");
 
         var pageSize = cursor.PageSize > 0 ? cursor.PageSize : BcPaging.SampleRows;
 
